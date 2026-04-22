@@ -39,3 +39,17 @@ export async function loadChunks(): Promise<RetrievalChunk[]> {
     return [];
   }
 }
+
+export async function getKbStats(): Promise<{
+  chunkCount: number;
+  fileCount: number;
+  files: string[];
+}> {
+  const chunks = await loadChunks();
+  const fileSet = new Set(chunks.map((chunk) => chunk.fileName));
+  return {
+    chunkCount: chunks.length,
+    fileCount: fileSet.size,
+    files: [...fileSet].sort((a, b) => a.localeCompare(b)).slice(-20),
+  };
+}

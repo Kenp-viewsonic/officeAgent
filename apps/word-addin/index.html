@@ -24,7 +24,12 @@
           <h2>模型配置</h2>
           <label>Base URL <input id="baseUrl" placeholder="https://api.openai.com/v1" /></label>
           <label>API Key <input id="apiKey" type="password" placeholder="sk-..." /></label>
-          <label>Model <input id="model" placeholder="gpt-4o-mini" /></label>
+          <label>Model
+            <div class="row actions">
+              <select id="model"></select>
+              <button id="refreshModels" class="secondary" type="button">刷新模型列表</button>
+            </div>
+          </label>
           <div class="row">
             <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.2" /></label>
             <label>Max Tokens <input id="maxTokens" type="number" min="128" step="1" value="900" /></label>
@@ -36,18 +41,43 @@
         <section class="subcard">
           <h2>知识库上传</h2>
           <input id="kbFile" type="file" />
-          <button id="uploadFile">上传并索引</button>
+          <div class="row actions">
+            <button id="uploadFile">上传并索引</button>
+            <button id="refreshKb" class="secondary">刷新知识库状态</button>
+          </div>
           <p id="kbStatus" class="status"></p>
+          <p id="kbMeta" class="status"></p>
         </section>
       </details>
 
       <section class="card">
         <h2>对话</h2>
+        <div class="row actions">
+          <select id="sessionSelect"></select>
+          <button id="newSession" class="secondary" type="button">新建会话</button>
+        </div>
+        <div class="row actions">
+          <button id="clearSession" class="secondary" type="button">清空当前会话</button>
+          <button id="deleteSession" class="secondary" type="button">删除当前会话</button>
+        </div>
         <div id="chatLog" class="chatlog"></div>
         <textarea id="userInput" rows="4" placeholder="例如：帮我把当前选区改成正式商务语气"></textarea>
         <div class="row actions">
           <button id="sendMsg">发送</button>
-          <button id="insertReply" class="secondary">插入最后回复到光标</button>
+          <select id="insertMode">
+            <option value="chat_only">仅对话，不插入</option>
+            <option value="replace_selection">替换当前选区</option>
+            <option value="smart_insert">智能定位插入</option>
+            <option value="append_end">追加到文末</option>
+          </select>
+        </div>
+        <div class="row actions">
+          <button id="insertReply" class="secondary">替换当前选区为最后回复</button>
+          <button id="retryLast" class="secondary" type="button">重试上一条</button>
+        </div>
+        <div class="row actions">
+          <button id="insertReplyCursor" class="secondary" type="button">插入最后回复到光标</button>
+          <span></span>
         </div>
         <p id="chatStatus" class="status"></p>
       </section>
