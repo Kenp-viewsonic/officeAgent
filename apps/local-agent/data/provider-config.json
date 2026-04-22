@@ -1,0 +1,7 @@
+{
+  "baseUrl": "http://10.70.60.9:443/v1",
+  "apiKey": "0",
+  "model": "Qwen3.5-9B.Q5_K_M.gguf",
+  "temperature": 0.2,
+  "maxTokens": 2000
+}

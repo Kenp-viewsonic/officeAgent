@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.env
+.env.*
+apps/local-agent/data/uploads/
+apps/local-agent/data/indexes/

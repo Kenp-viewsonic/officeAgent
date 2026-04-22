@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Office Agent Local</title>
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <h1>Word Agent</h1>
+        <p>本地运行，直连你的模型订阅</p>
+      </header>
+
+      <details class="card menu-card" open>
+        <summary>
+          <span>配置菜单</span>
+          <span class="summary-hint">模型与知识库</span>
+        </summary>
+
+        <section class="subcard">
+          <h2>模型配置</h2>
+          <label>Base URL <input id="baseUrl" placeholder="https://api.openai.com/v1" /></label>
+          <label>API Key <input id="apiKey" type="password" placeholder="sk-..." /></label>
+          <label>Model <input id="model" placeholder="gpt-4o-mini" /></label>
+          <div class="row">
+            <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.2" /></label>
+            <label>Max Tokens <input id="maxTokens" type="number" min="128" step="1" value="900" /></label>
+          </div>
+          <button id="saveConfig">保存配置</button>
+          <p id="configStatus" class="status"></p>
+        </section>
+
+        <section class="subcard">
+          <h2>知识库上传</h2>
+          <input id="kbFile" type="file" />
+          <button id="uploadFile">上传并索引</button>
+          <p id="kbStatus" class="status"></p>
+        </section>
+      </details>
+
+      <section class="card">
+        <h2>对话</h2>
+        <div id="chatLog" class="chatlog"></div>
+        <textarea id="userInput" rows="4" placeholder="例如：帮我把当前选区改成正式商务语气"></textarea>
+        <div class="row actions">
+          <button id="sendMsg">发送</button>
+          <button id="insertReply" class="secondary">插入最后回复到光标</button>
+        </div>
+        <p id="chatStatus" class="status"></p>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

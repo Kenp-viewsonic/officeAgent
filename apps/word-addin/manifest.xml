@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+           xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+           xsi:type="TaskPaneApp">
+  <Id>6c55b4c0-9f66-4a95-8fb9-df8e2a4f1f11</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Office Agent Local</ProviderName>
+  <DefaultLocale>zh-CN</DefaultLocale>
+  <DisplayName DefaultValue="Word Agent Local" />
+  <Description DefaultValue="本地运行的 Word Copilot 风格助手" />
+  <IconUrl DefaultValue="https://localhost:3001/icon-32.png" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:3001/icon-80.png" />
+  <SupportUrl DefaultValue="https://localhost:3001" />
+  <AppDomains>
+    <AppDomain>https://localhost:3001</AppDomain>
+    <AppDomain>http://127.0.0.1:8787</AppDomain>
+  </AppDomains>
+  <Hosts>
+    <Host Name="Document" />
+  </Hosts>
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://localhost:3001" />
+  </DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Document">
+        <DesktopFormFactor>
+          <GetStarted>
+            <Title resid="GetStarted.Title" />
+            <Description resid="GetStarted.Description" />
+            <LearnMoreUrl resid="GetStarted.LearnMoreUrl" />
+          </GetStarted>
+          <FunctionFile resid="Commands.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="OfficeAgent.Group">
+                <Label resid="OfficeAgent.GroupLabel" />
+                <Icon>
+                  <bt:Image size="16" resid="Icon.16" />
+                  <bt:Image size="32" resid="Icon.32" />
+                  <bt:Image size="80" resid="Icon.80" />
+                </Icon>
+                <Control xsi:type="Button" id="OfficeAgent.TaskpaneButton">
+                  <Label resid="OfficeAgent.ButtonLabel" />
+                  <Supertip>
+                    <Title resid="OfficeAgent.ButtonLabel" />
+                    <Description resid="OfficeAgent.ButtonTooltip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16" />
+                    <bt:Image size="32" resid="Icon.32" />
+                    <bt:Image size="80" resid="Icon.80" />
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>OfficeAgentTaskpane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon.16" DefaultValue="https://localhost:3001/icon-16.png" />
+        <bt:Image id="Icon.32" DefaultValue="https://localhost:3001/icon-32.png" />
+        <bt:Image id="Icon.80" DefaultValue="https://localhost:3001/icon-80.png" />
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://localhost:3001" />
+        <bt:Url id="Commands.Url" DefaultValue="https://localhost:3001" />
+        <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3001" />
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="Word Agent Local" />
+        <bt:String id="OfficeAgent.GroupLabel" DefaultValue="Office Agent" />
+        <bt:String id="OfficeAgent.ButtonLabel" DefaultValue="打开 Agent" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="本地运行的 Word Copilot 风格助手" />
+        <bt:String id="OfficeAgent.ButtonTooltip" DefaultValue="打开本地 Agent 侧边栏" />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>

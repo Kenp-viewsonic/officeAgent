@@ -1,0 +1,14 @@
+{
+  "name": "office-agent-local",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/word-addin",
+    "apps/local-agent"
+  ],
+  "scripts": {
+    "dev:agent": "npm run dev -w @office-agent/local-agent",
+    "dev:addin": "npm run dev -w @office-agent/word-addin",
+    "build": "npm run build --workspaces"
+  }
+}

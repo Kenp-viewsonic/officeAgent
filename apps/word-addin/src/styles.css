@@ -1,0 +1,165 @@
+:root {
+  --bg: #f4f7f7;
+  --card: #ffffff;
+  --text: #122025;
+  --muted: #5c6e75;
+  --brand: #0b8f6c;
+  --line: #dce5e8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top right, #d7efe8, transparent 50%), var(--bg);
+  font-family: "Segoe UI", "PingFang SC", sans-serif;
+  color: var(--text);
+}
+
+.app {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.menu-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.menu-card > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+}
+
+.menu-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.summary-hint {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.subcard {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px 12px;
+}
+
+.subcard + .subcard {
+  border-top: 1px solid var(--line);
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: #fff;
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--brand);
+  color: #fff;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: #54656c;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.actions {
+  grid-template-columns: 1fr 1fr;
+}
+
+.chatlog {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfdfd;
+  min-height: 160px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.msg {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.msg.user {
+  background: #e3f7f0;
+}
+
+.msg.assistant {
+  background: #eef3f5;
+}
+
+.status {
+  margin: 0;
+  min-height: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
