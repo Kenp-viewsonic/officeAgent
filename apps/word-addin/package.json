@@ -9,6 +9,7 @@
     "preview": "vite preview --port 3000"
   },
   "dependencies": {
+    "@microsoft/office-js": "^1.1.110",
     "zod": "^3.24.1"
   },
   "devDependencies": {

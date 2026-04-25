@@ -40,6 +40,34 @@ export async function loadChunks(): Promise<RetrievalChunk[]> {
   }
 }
 
+export async function deleteChunksByFile(fileName: string): Promise<number> {
+  const current = await loadChunks();
+  const remaining = current.filter((chunk) => chunk.fileName !== fileName);
+  const removed = current.length - remaining.length;
+  await ensureDataRoot();
+  await fs.writeFile(kbFile, JSON.stringify(remaining, null, 2), "utf-8");
+  return removed;
+}
+
+export async function clearAllChunks(): Promise<number> {
+  const current = await loadChunks();
+  const removed = current.length;
+  await ensureDataRoot();
+  await fs.writeFile(kbFile, "[]", "utf-8");
+  return removed;
+}
+
+export async function getKbFileList(): Promise<Array<{ fileName: string; chunkCount: number }>> {
+  const chunks = await loadChunks();
+  const map = new Map<string, number>();
+  for (const chunk of chunks) {
+    map.set(chunk.fileName, (map.get(chunk.fileName) ?? 0) + 1);
+  }
+  return [...map.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([fileName, chunkCount]) => ({ fileName, chunkCount }));
+}
+
 export async function getKbStats(): Promise<{
   chunkCount: number;
   fileCount: number;
@@ -52,4 +80,12 @@ export async function getKbStats(): Promise<{
     fileCount: fileSet.size,
     files: [...fileSet].sort((a, b) => a.localeCompare(b)).slice(-20),
   };
+}
+
+export async function importChunks(chunks: RetrievalChunk[], mode: "merge" | "replace"): Promise<{ importedChunks: number; totalChunks: number }> {
+  await ensureDataRoot();
+  const existing = mode === "replace" ? [] : await loadChunks();
+  const merged = [...existing, ...chunks];
+  await fs.writeFile(kbFile, JSON.stringify(merged, null, 2), "utf-8");
+  return { importedChunks: chunks.length, totalChunks: merged.length };
 }

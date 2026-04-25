@@ -4,10 +4,10 @@ import multer from "multer";
 import path from "node:path";
 import mammoth from "mammoth";
 import { z } from "zod";
-import { callOpenAICompatible, listOpenAICompatibleModels, LlmHttpError, streamOpenAICompatible } from "./llm.js";
+import { callOpenAICompatible, describeDocumentStructure, listOpenAICompatibleModels, LlmHttpError, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
 import { keywordRetrieve, splitToChunks } from "./retrieval.js";
-import { appendChunks, getKbStats, loadChunks, loadProviderConfig, saveProviderConfig } from "./store.js";
-import { ChatMessage } from "./types.js";
+import { appendChunks, clearAllChunks, deleteChunksByFile, getKbFileList, getKbStats, importChunks, loadChunks, loadProviderConfig, saveProviderConfig } from "./store.js";
+import { ActionPlan, ChatMessage, DocumentStructure } from "./types.js";
 
 const app = express();
 const upload = multer({ limits: { fileSize: Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024 } });
@@ -72,6 +72,8 @@ const configSchema = z.object({
   model: z.string().min(1),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().positive().optional(),
+  firstTokenTimeout: z.number().int().min(5).max(120).optional(),
+  overallTimeout: z.number().int().min(30).max(600).optional(),
 });
 
 app.post("/v1/provider/config", async (req, res) => {
@@ -101,6 +103,8 @@ app.get("/v1/provider/config", async (_req, res) => {
     model: config.model,
     temperature: config.temperature,
     maxTokens: config.maxTokens,
+    firstTokenTimeout: config.firstTokenTimeout,
+    overallTimeout: config.overallTimeout,
     hasApiKey: Boolean(config.apiKey),
   });
 });
@@ -154,10 +158,88 @@ app.post("/v1/kb/upload", upload.single("file"), async (req, res) => {
   return res.json({ ok: true, fileName: file.originalname, chunkCount: chunks.length });
 });
 
+app.get("/v1/kb/files", async (_req, res) => {
+  const files = await getKbFileList();
+  return res.json({ ok: true, files });
+});
+
+app.delete("/v1/kb/files/:fileName", async (req, res) => {
+  const fileName = decodeURIComponent(req.params.fileName);
+  if (!fileName) {
+    return res.status(400).json({ error: "fileName is required" });
+  }
+
+  const removed = await deleteChunksByFile(fileName);
+  if (removed === 0) {
+    return res.status(404).json({ error: `File not found: ${fileName}` });
+  }
+
+  return res.json({ ok: true, fileName, removedChunks: removed });
+});
+
+app.delete("/v1/kb/clear", async (_req, res) => {
+  const removed = await clearAllChunks();
+  return res.json({ ok: true, removedChunks: removed });
+});
+
+app.get("/v1/kb/export", async (_req, res) => {
+  const chunks = await loadChunks();
+  return res.json({ ok: true, chunks, exportedAt: new Date().toISOString() });
+});
+
+const importSchema = z.object({
+  chunks: z.array(z.object({
+    id: z.string(),
+    fileName: z.string(),
+    text: z.string(),
+  })),
+  mode: z.enum(["merge", "replace"]).optional(),
+});
+
+app.post("/v1/kb/import", async (req, res) => {
+  const result = importSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({ error: "Invalid import payload", details: result.error.flatten() });
+  }
+
+  const { chunks, mode = "merge" } = result.data;
+
+  try {
+    const { importedChunks, totalChunks } = await importChunks(chunks, mode as "merge" | "replace");
+    return res.json({ ok: true, importedChunks, totalChunks, mode });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "导入失败";
+    return res.status(500).json({ error: message });
+  }
+});
+
+// --- Chat Schema with document structure and insert mode ---
+
+const documentStructureSchema = z.object({
+  title: z.string(),
+  totalParagraphs: z.number(),
+  totalCharacters: z.number(),
+  paragraphs: z.array(z.object({
+    index: z.number(),
+    text: z.string(),
+    style: z.string(),
+    headingLevel: z.number().optional(),
+    isTable: z.boolean(),
+    isList: z.boolean(),
+  })),
+  selection: z.object({
+    text: z.string(),
+    startParagraphIndex: z.number().optional(),
+    endParagraphIndex: z.number().optional(),
+  }),
+});
+
 const chatSchema = z.object({
   messages: z.array(z.object({ role: z.enum(["system", "user", "assistant"]), content: z.string().min(1) })),
   documentContext: z.string().optional(),
+  documentStructure: documentStructureSchema.optional(),
   selection: z.string().optional(),
+  insertMode: z.enum(["chat_only", "smart_action", "replace_selection", "append_end"]).optional(),
 });
 
 async function buildChatContext(payload: z.infer<typeof chatSchema>) {
@@ -180,12 +262,22 @@ async function buildChatContext(payload: z.infer<typeof chatSchema>) {
     contextParts.push(`当前选区:\n${payload.selection}`);
   }
 
+  // Build document structure description for the system prompt
+  let documentStructureDescription: string | undefined;
+  if (payload.documentStructure) {
+    documentStructureDescription = describeDocumentStructure(payload.documentStructure);
+  }
+
   const enrichedMessages: ChatMessage[] = contextParts.length
     ? [{ role: "system", content: contextParts.join("\n\n") }, ...messages]
     : messages;
 
-  return { provider, enrichedMessages, retrieved };
+  const insertMode = payload.insertMode || "smart_action";
+
+  return { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode };
 }
+
+// --- Non-streaming chat endpoint ---
 
 app.post("/v1/chat", async (req, res) => {
   const parsed = chatSchema.safeParse(req.body);
@@ -194,11 +286,19 @@ app.post("/v1/chat", async (req, res) => {
   }
 
   try {
-    const { provider, enrichedMessages, retrieved } = await buildChatContext(parsed.data);
-    const reply = await callOpenAICompatible(provider, enrichedMessages, retrieved);
+    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode } = await buildChatContext(parsed.data);
+    const result = await callOpenAICompatible(
+      provider,
+      enrichedMessages,
+      retrieved,
+      WORD_TOOLS,
+      insertMode,
+      documentStructureDescription
+    );
     return res.json({
       ok: true,
-      reply,
+      reply: result.reply,
+      actionPlan: result.actionPlan,
       retrievalCount: retrieved.length,
       citations: retrieved.map((c) => ({ id: c.id, fileName: c.fileName })),
     });
@@ -216,6 +316,8 @@ app.post("/v1/chat", async (req, res) => {
     return res.status(502).json({ error: message });
   }
 });
+
+// --- Streaming chat endpoint ---
 
 app.post("/v1/chat/stream", async (req, res) => {
   const parsed = chatSchema.safeParse(req.body);
@@ -235,7 +337,7 @@ app.post("/v1/chat/stream", async (req, res) => {
   });
 
   try {
-    const { provider, enrichedMessages, retrieved } = await buildChatContext(parsed.data);
+    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode } = await buildChatContext(parsed.data);
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -245,16 +347,19 @@ app.post("/v1/chat/stream", async (req, res) => {
     // Send an immediate event to confirm stream startup to the client.
     res.write(`data: ${JSON.stringify({ type: "start", ts: Date.now() })}\n\n`);
 
-    let reply: string;
+    let result: { reply: string; actionPlan: ActionPlan | null };
     try {
-      reply = await streamOpenAICompatible(
+      result = await streamOpenAICompatible(
         provider,
         enrichedMessages,
         retrieved,
         (delta) => {
           res.write(`data: ${JSON.stringify({ type: "delta", delta })}\n\n`);
         },
-        abortController.signal
+        abortController.signal,
+        WORD_TOOLS,
+        insertMode,
+        documentStructureDescription
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -266,13 +371,14 @@ app.post("/v1/chat/stream", async (req, res) => {
 
       // Some OpenAI-compatible providers accept stream=true but don't emit SSE chunks.
       // Fall back to non-stream completion so client can still receive a final answer.
-      reply = await callOpenAICompatible(provider, enrichedMessages, retrieved);
+      result = await callOpenAICompatible(provider, enrichedMessages, retrieved, WORD_TOOLS, insertMode, documentStructureDescription);
       res.write(`data: ${JSON.stringify({ type: "fallback", reason: "no_stream_delta" })}\n\n`);
     }
 
     res.write(`data: ${JSON.stringify({
       type: "done",
-      reply,
+      reply: result.reply,
+      actionPlan: result.actionPlan,
       retrievalCount: retrieved.length,
       citations: retrieved.map((c) => ({ id: c.id, fileName: c.fileName })),
     })}\n\n`);

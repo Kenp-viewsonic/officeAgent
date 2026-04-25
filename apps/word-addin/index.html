@@ -10,14 +10,17 @@
   <body>
     <main class="app">
       <header class="header">
-        <h1>Word Agent</h1>
+        <div class="header-row">
+          <h1>Word Agent</h1>
+          <button id="menuToggle" class="menu-toggle" type="button" aria-label="菜单">☰</button>
+        </div>
         <p>本地运行，直连你的模型订阅</p>
       </header>
 
-      <details class="card menu-card" open>
+      <details class="card menu-card" id="menuCard">
         <summary>
-          <span>配置菜单</span>
-          <span class="summary-hint">模型与知识库</span>
+          <span>配置与知识库</span>
+          <span class="summary-hint">展开管理</span>
         </summary>
 
         <section class="subcard">
@@ -26,7 +29,8 @@
           <label>API Key <input id="apiKey" type="password" placeholder="sk-..." /></label>
           <label>Model
             <div class="row actions">
-              <select id="model"></select>
+              <input id="model" list="modelList" placeholder="输入或选择模型ID" />
+              <datalist id="modelList"></datalist>
               <button id="refreshModels" class="secondary" type="button">刷新模型列表</button>
             </div>
           </label>
@@ -34,19 +38,39 @@
             <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.2" /></label>
             <label>Max Tokens <input id="maxTokens" type="number" min="128" step="1" value="900" /></label>
           </div>
+          <div class="row">
+            <label>首次响应超时(秒) <input id="firstTokenTimeout" type="number" min="5" max="120" step="1" value="20" /></label>
+            <label>整体超时(秒) <input id="overallTimeout" type="number" min="30" max="600" step="10" value="240" /></label>
+          </div>
           <button id="saveConfig">保存配置</button>
           <p id="configStatus" class="status"></p>
         </section>
 
         <section class="subcard">
-          <h2>知识库上传</h2>
+          <h2>知识库管理</h2>
           <input id="kbFile" type="file" />
           <div class="row actions">
             <button id="uploadFile">上传并索引</button>
-            <button id="refreshKb" class="secondary">刷新知识库状态</button>
+            <button id="refreshKb" class="secondary">刷新状态</button>
           </div>
           <p id="kbStatus" class="status"></p>
           <p id="kbMeta" class="status"></p>
+          <div id="kbFileList" class="kb-file-list"></div>
+          <div class="row actions">
+            <button id="clearKb" class="secondary danger">清空知识库</button>
+            <button id="exportKb" class="secondary" type="button">导出存档</button>
+          </div>
+          <div class="row actions">
+            <label class="import-label">
+              <input id="importKbFile" type="file" accept=".json" hidden />
+              <span class="import-btn secondary">导入存档</span>
+            </label>
+            <select id="importMode">
+              <option value="merge">合并（保留现有）</option>
+              <option value="replace">替换（覆盖现有）</option>
+            </select>
+          </div>
+          <p id="kbImportStatus" class="status"></p>
         </section>
       </details>
 
@@ -58,16 +82,16 @@
         </div>
         <div class="row actions">
           <button id="clearSession" class="secondary" type="button">清空当前会话</button>
-          <button id="deleteSession" class="secondary" type="button">删除当前会话</button>
+          <button id="deleteSession" class="secondary danger" type="button">删除当前会话</button>
         </div>
         <div id="chatLog" class="chatlog"></div>
-        <textarea id="userInput" rows="4" placeholder="例如：帮我把当前选区改成正式商务语气"></textarea>
+        <textarea id="userInput" rows="4" placeholder="例如：在第三章后加一段总结"></textarea>
         <div class="row actions">
           <button id="sendMsg">发送</button>
           <select id="insertMode">
-            <option value="chat_only">仅对话，不插入</option>
+            <option value="smart_action">智能操作（LLM 决定）</option>
+            <option value="chat_only">仅对话，不操作文档</option>
             <option value="replace_selection">替换当前选区</option>
-            <option value="smart_insert">智能定位插入</option>
             <option value="append_end">追加到文末</option>
           </select>
         </div>
@@ -78,6 +102,30 @@
         <div class="row actions">
           <button id="insertReplyCursor" class="secondary" type="button">插入最后回复到光标</button>
           <span></span>
+        </div>
+
+        <!-- Action Plan Preview Panel -->
+        <div id="actionPlanPanel" class="action-plan-panel" style="display:none;">
+          <div class="action-plan-header">
+            <span>📋 操作计划预览</span>
+            <div class="row actions">
+              <button id="actionPlanConfirm" class="action-plan-btn">确认执行</button>
+              <button id="actionPlanCancel" class="action-plan-btn secondary">取消</button>
+            </div>
+          </div>
+          <div id="actionPlanContent" class="action-plan-content"></div>
+        </div>
+
+        <!-- Simple Text Preview Panel (legacy) -->
+        <div id="previewPanel" class="preview-panel" style="display:none;">
+          <div class="preview-header">
+            <span>预览：即将插入的内容</span>
+            <div class="row actions">
+              <button id="previewConfirm" class="preview-btn">确认插入</button>
+              <button id="previewCancel" class="preview-btn secondary">取消</button>
+            </div>
+          </div>
+          <div id="previewContent" class="preview-content"></div>
         </div>
         <p id="chatStatus" class="status"></p>
       </section>
