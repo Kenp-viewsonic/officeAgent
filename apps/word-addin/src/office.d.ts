@@ -25,6 +25,7 @@ declare namespace Word {
 
   interface Range {
     text: string;
+    font: Word.Font;
     insertText(text: string, location: Word.InsertLocation): Word.Range;
     insertParagraph(paragraphText: string, insertLocation: Word.InsertLocation): Word.Paragraph;
     load(option: string | string[]): void;
@@ -33,11 +34,22 @@ declare namespace Word {
     getFirst(): Word.Range;
   }
 
+  interface Font {
+    name: string;
+    size: number;
+    color: string;
+    bold: boolean | string;
+    italic: boolean | string;
+    underline: string;
+    load(option: string | string[]): void;
+  }
+
   interface Paragraph {
     text: string;
     style: string;
     isListItem: boolean;
     insertParagraph(paragraphText: string, insertLocation: Word.InsertLocation): Word.Paragraph;
+    getRange(rangeLocation: string): Word.Range;
     delete(): void;
     load(option: string | string[]): void;
   }

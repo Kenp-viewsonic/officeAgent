@@ -9,8 +9,15 @@ export type ProviderConfig = {
 };
 
 export type ChatMessage = {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  tool_call_id?: string;
+  name?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
 };
 
 export type RetrievalChunk = {
@@ -28,6 +35,7 @@ export type DocumentParagraph = {
   headingLevel?: number;
   isTable: boolean;
   isList: boolean;
+  charCount?: number;
 };
 
 export type DocumentStructure = {
@@ -48,11 +56,41 @@ export type WordAction = {
   action: string;
   params: Record<string, any>;
   description: string;
+  toolCallId?: string;
 };
 
 export type ActionPlan = {
   actions: WordAction[];
   explanation: string;
+};
+
+// --- Action Execution Result ---
+
+export type ActionResult = {
+  action: string;
+  success: boolean;
+  message: string;
+  details?: string;
+  data?: Record<string, any>;
+};
+
+// --- Tool Call Result (for Agent Loop) ---
+
+export type ToolCallResult = {
+  toolCallId: string;
+  toolName: string;
+  result: string;
+  success: boolean;
+  data?: Record<string, any>;
+};
+
+// --- Agent Session (for multi-turn tool calling) ---
+
+export type AgentSession = {
+  id: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
 };
 
 // --- Tool Definitions (OpenAI Function Calling format) ---
@@ -73,8 +111,45 @@ export type ToolDefinition = {
 export type LlmResponse = {
   reply: string;
   actionPlan: ActionPlan | null;
+  toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
+};
+
+// --- Agent Continue Payload ---
+
+export type AgentContinuePayload = {
+  sessionId: string;
+  toolCallId: string;
+  result: string;
+};
+
+// --- Agent Stream Options ---
+
+export type AgentStreamOptions = {
+  enableReAct?: boolean;
+  maxIterations?: number;
 };
 
 // --- Insert Mode ---
 
 export type InsertMode = "chat_only" | "smart_action" | "replace_selection" | "append_end";
+
+// --- Read Document Modes ---
+
+export type ReadDocumentMode = "paragraph_range" | "heading_context" | "selection" | "cursor_surrounding";
+
+// --- Rich Format Options ---
+
+export type RichFormatOptions = {
+  font?: { name?: string; size?: number; color?: string; bold?: boolean; italic?: boolean };
+  hyperlink?: { text: string; url: string };
+};
+
+// --- Find and Replace V2 Options ---
+
+export type FindReplaceV2Options = {
+  find_text: string;
+  replace_text: string;
+  replace_all?: boolean;
+  match_case?: boolean;
+  match_whole_word?: boolean;
+};

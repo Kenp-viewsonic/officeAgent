@@ -32,6 +32,7 @@ type WordAction = {
   action: string;
   params: Record<string, any>;
   description: string;
+  toolCallId?: string;
 };
 
 type ActionPlan = {
@@ -69,12 +70,14 @@ const state: {
   lastReply: string;
   pendingActionPlan: ActionPlan | null;
   pendingSimpleInsert: SimpleInsertPlan | null;
+  pendingSessionId: string | null;
 } = {
   sessions: [],
   activeSessionId: null,
   lastReply: "",
   pendingActionPlan: null,
   pendingSimpleInsert: null,
+  pendingSessionId: null,
 };
 
 // ─── DOM Helpers ─────────────────────────────────────────────────────────────
@@ -707,6 +710,33 @@ async function getStructuredContext(): Promise<DocumentStructure> {
       selection.load("text");
       await context.sync();
 
+      let startParagraphIndex: number | undefined;
+      let endParagraphIndex: number | undefined;
+
+      if (selection.text) {
+        const selParagraphs = selection.paragraphs;
+        selParagraphs.load("items");
+        await context.sync();
+
+        if (selParagraphs.items.length > 0) {
+          const firstText = (selParagraphs.items[0].text || "").trim();
+          const lastText = (selParagraphs.items[selParagraphs.items.length - 1].text || "").trim();
+
+          for (const p of paraList) {
+            if (startParagraphIndex === undefined) {
+              if (p.text === firstText || p.text.startsWith(firstText) || firstText.startsWith(p.text)) {
+                startParagraphIndex = p.index;
+              }
+            }
+            if (endParagraphIndex === undefined) {
+              if (p.text === lastText || p.text.startsWith(lastText) || lastText.startsWith(p.text)) {
+                endParagraphIndex = p.index;
+              }
+            }
+          }
+        }
+      }
+
       // Get total text length (approximate)
       body.load("text");
       await context.sync();
@@ -718,6 +748,8 @@ async function getStructuredContext(): Promise<DocumentStructure> {
         paragraphs: paraList,
         selection: {
           text: (selection.text || "").slice(0, 2000),
+          startParagraphIndex,
+          endParagraphIndex,
         },
       };
     });
@@ -756,6 +788,224 @@ async function getWordContext(): Promise<{ documentContext: string; selection: s
   }
 }
 
+// ─── Perception Tools (for Agent Loop) ───────────────────────────────────────
+
+async function readDocument(params: Record<string, any>): Promise<string> {
+  if (typeof Word === "undefined") {
+    throw new Error("当前不在 Word 宿主中");
+  }
+
+  return Word.run(async (context) => {
+    const body = context.document.body;
+
+    switch (params.mode) {
+      case "paragraph_range": {
+        const start = params.paragraph_index ?? 0;
+        const count = params.count ?? 5;
+        const paragraphs = body.paragraphs;
+        paragraphs.load("items");
+        await context.sync();
+
+        const result: string[] = [];
+        for (let i = start; i < Math.min(start + count, paragraphs.items.length); i++) {
+          const p = paragraphs.items[i];
+          p.load(["text", "style", "isListItem"]);
+        }
+        await context.sync();
+
+        for (let i = start; i < Math.min(start + count, paragraphs.items.length); i++) {
+          const p = paragraphs.items[i];
+          const style = (p.style || "Normal").toString();
+          const headingMatch = style.match(/Heading\s*(\d)/i);
+          const headingLevel = headingMatch ? parseInt(headingMatch[1]) : undefined;
+          result.push(`[段落${i}] ${headingLevel ? `标题${headingLevel} ` : ""}${p.text || ""}`);
+        }
+
+        return result.length
+          ? `读取段落 ${start} 起共 ${result.length} 段（总计 ${paragraphs.items.length} 段）：\n${result.join("\n")}`
+          : "未读取到段落内容";
+      }
+
+      case "heading_context": {
+        if (!params.heading_text) {
+          throw new Error("heading_context 模式需要提供 heading_text");
+        }
+        const matches = body.search(params.heading_text, { matchCase: false, matchWholeWord: false });
+        matches.load("items");
+        await context.sync();
+
+        if (matches.items.length === 0) {
+          return `未找到标题"${params.heading_text}"`;
+        }
+
+        const startPara = matches.items[0].paragraphs.getFirst();
+        startPara.load(["text", "style"]);
+        await context.sync();
+
+        const startLevelMatch = (startPara.style || "").toString().match(/Heading\s*(\d)/i);
+        const startLevel = startLevelMatch ? parseInt(startLevelMatch[1]) : 0;
+
+        const paragraphs = body.paragraphs;
+        paragraphs.load("items");
+        await context.sync();
+
+        let found = false;
+        const result: string[] = [];
+        for (let i = 0; i < paragraphs.items.length; i++) {
+          const p = paragraphs.items[i];
+          p.load(["text", "style"]);
+          await context.sync();
+
+          const levelMatch = (p.style || "").toString().match(/Heading\s*(\d)/i);
+          const level = levelMatch ? parseInt(levelMatch[1]) : 0;
+
+          if (!found) {
+            if (p.text.trim() === startPara.text.trim()) {
+              found = true;
+              result.push(`[段落${i}] 标题${level} ${p.text}`);
+            }
+            continue;
+          }
+
+          if (level > 0 && level <= startLevel) {
+            break;
+          }
+          result.push(`[段落${i}] ${p.text}`);
+        }
+
+        return `标题"${params.heading_text}"及其子内容：\n${result.join("\n")}`;
+      }
+
+      case "selection": {
+        const selection = context.document.getSelection();
+        selection.load("text");
+        await context.sync();
+        const text = (selection.text || "").slice(0, 2000);
+        return text ? `当前选区内容：${text}` : "当前无选中文本";
+      }
+
+      case "cursor_surrounding": {
+        const chars = params.surrounding_chars ?? 500;
+        const selection = context.document.getSelection();
+        selection.load("text");
+        await context.sync();
+
+        const selText = selection.text || "";
+        const start = Math.max(0, Math.floor(selText.length / 2) - chars);
+        const end = Math.min(selText.length, Math.floor(selText.length / 2) + chars);
+        const surrounding = selText.slice(start, end);
+
+        return `光标周围内容：${surrounding || "（无法获取光标周围内容）"}`;
+      }
+
+      default:
+        return `未知的读取模式: ${params.mode}`;
+    }
+  });
+}
+
+async function getSelectionInfo(): Promise<string> {
+  if (typeof Word === "undefined") {
+    throw new Error("当前不在 Word 宿主中");
+  }
+
+  return Word.run(async (context) => {
+    const selection = context.document.getSelection();
+    selection.load("text");
+    await context.sync();
+
+    const text = selection.text || "";
+    const isCursorOnly = text.length === 0;
+
+    let startParagraphIndex: number | undefined;
+    let endParagraphIndex: number | undefined;
+
+    const selParagraphs = selection.paragraphs;
+    selParagraphs.load("items");
+    await context.sync();
+
+    if (selParagraphs.items.length > 0) {
+      const bodyParagraphs = context.document.body.paragraphs;
+      bodyParagraphs.load("items");
+      await context.sync();
+
+      const firstSelText = (selParagraphs.items[0].text || "").trim();
+      const lastSelText = (selParagraphs.items[selParagraphs.items.length - 1].text || "").trim();
+
+      for (let i = 0; i < bodyParagraphs.items.length; i++) {
+        const p = bodyParagraphs.items[i];
+        p.load("text");
+        await context.sync();
+        const pText = (p.text || "").trim();
+        if (startParagraphIndex === undefined && (pText === firstSelText || pText.startsWith(firstSelText))) {
+          startParagraphIndex = i;
+        }
+        if (endParagraphIndex === undefined && (pText === lastSelText || pText.startsWith(lastSelText))) {
+          endParagraphIndex = i;
+        }
+      }
+    }
+
+    const info = {
+      isCursorOnly,
+      textLength: text.length,
+      text: text.slice(0, 200),
+      startParagraphIndex,
+      endParagraphIndex,
+      paragraphCount: selParagraphs.items.length,
+    };
+
+    return JSON.stringify(info, null, 2);
+  });
+}
+
+async function getDocumentStats(): Promise<string> {
+  if (typeof Word === "undefined") {
+    throw new Error("当前不在 Word 宿主中");
+  }
+
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    const paragraphs = body.paragraphs;
+    paragraphs.load("items");
+    await context.sync();
+
+    const headings: Array<{ level: number; text: string; paragraphIndex: number }> = [];
+    let listCount = 0;
+
+    for (let i = 0; i < paragraphs.items.length; i++) {
+      const p = paragraphs.items[i];
+      p.load(["text", "style", "isListItem"]);
+    }
+    await context.sync();
+
+    for (let i = 0; i < paragraphs.items.length; i++) {
+      const p = paragraphs.items[i];
+      const style = (p.style || "Normal").toString();
+      const headingMatch = style.match(/Heading\s*(\d)/i);
+      if (headingMatch) {
+        headings.push({ level: parseInt(headingMatch[1]), text: (p.text || "").trim().slice(0, 100), paragraphIndex: i });
+      }
+      if (p.isListItem) {
+        listCount++;
+      }
+    }
+
+    body.load("text");
+    await context.sync();
+
+    const stats = {
+      totalParagraphs: paragraphs.items.length,
+      totalCharacters: (body.text || "").length,
+      headingCount: headings.length,
+      listParagraphCount: listCount,
+      headings,
+    };
+
+    return JSON.stringify(stats, null, 2);
+  });
+}
+
 // ─── Word Action Execution ───────────────────────────────────────────────────
 
 async function applyFormat(
@@ -763,11 +1013,12 @@ async function applyFormat(
   format: string,
   context: Word.RequestContext
 ): Promise<void> {
-  if (format === "normal" || !format) return;
+  if (!format) return;
 
   // Word JS API style names — try English first, then Chinese fallback
   // Chinese Word uses localized style names like "标题 1"
   const styleMap: Record<string, string[]> = {
+    normal: ["Normal", "正文"],
     heading1: ["Heading 1", "标题 1", "标题1"],
     heading2: ["Heading 2", "标题 2", "标题2"],
     heading3: ["Heading 3", "标题 3", "标题3"],
@@ -803,6 +1054,9 @@ async function executeAction(action: WordAction): Promise<string> {
     switch (action.action) {
       case "insert_after_heading": {
         const { heading_text, content, format = "normal" } = action.params;
+        if (!content || String(content).trim().length === 0) {
+          throw new Error("插入内容为空或仅包含空白字符");
+        }
         const matches = body.search(heading_text, { matchCase: false, matchWholeWord: false });
         matches.load("items");
         await context.sync();
@@ -826,6 +1080,9 @@ async function executeAction(action: WordAction): Promise<string> {
 
       case "replace_selection": {
         const { content, format = "normal" } = action.params;
+        if (!content || String(content).trim().length === 0) {
+          throw new Error("替换内容为空或仅包含空白字符");
+        }
         const selection = context.document.getSelection();
         const para = selection.insertParagraph(content, "Replace");
         await context.sync();
@@ -835,8 +1092,16 @@ async function executeAction(action: WordAction): Promise<string> {
 
       case "insert_at_end": {
         const { content, format = "normal" } = action.params;
-        const lastPara = body.paragraphs.getLast();
-        const newPara = lastPara.insertParagraph(content, "After");
+        if (!content || String(content).trim().length === 0) {
+          throw new Error("插入内容为空或仅包含空白字符");
+        }
+        let newPara: Word.Paragraph;
+        try {
+          const lastPara = body.paragraphs.getLast();
+          newPara = lastPara.insertParagraph(String(content), "After");
+        } catch {
+          newPara = body.insertParagraph(String(content), "End");
+        }
         await context.sync();
         await applyFormat(newPara, format, context);
         return "已追加到文档末尾";
@@ -870,6 +1135,9 @@ async function executeAction(action: WordAction): Promise<string> {
 
       case "insert_after_paragraph": {
         const { paragraph_index, content, format = "normal" } = action.params;
+        if (!content || String(content).trim().length === 0) {
+          throw new Error("插入内容为空或仅包含空白字符");
+        }
         const paragraphs = body.paragraphs;
         paragraphs.load("items");
         await context.sync();
@@ -917,9 +1185,151 @@ async function executeAction(action: WordAction): Promise<string> {
         return `未找到"${find_text}"`;
       }
 
+      case "read_document": {
+        const result = await readDocument(action.params);
+        return result;
+      }
+
+      case "get_selection_info": {
+        const result = await getSelectionInfo();
+        return result;
+      }
+
+      case "get_document_stats": {
+        const result = await getDocumentStats();
+        return result;
+      }
+
+      case "insert_at_cursor": {
+        const { content, format = "normal" } = action.params;
+        if (!content || String(content).trim().length === 0) {
+          throw new Error("插入内容为空或仅包含空白字符");
+        }
+        const selection = context.document.getSelection();
+        const para = selection.insertParagraph(String(content), "Replace");
+        await context.sync();
+        await applyFormat(para, format, context);
+        return "已在光标处插入内容";
+      }
+
+      case "find_and_replace_v2": {
+        const { find_text, replace_text, replace_all = false, match_case = false, match_whole_word = false } = action.params;
+        const ranges = body.search(find_text, { matchCase: match_case, matchWholeWord: match_whole_word });
+        ranges.load("items");
+        await context.sync();
+
+        let replaced = 0;
+        for (const range of ranges.items) {
+          range.insertText(replace_text, "Replace");
+          replaced++;
+          if (!replace_all) break;
+        }
+        await context.sync();
+        return `已替换 ${replaced} 处匹配（共找到 ${ranges.items.length} 处）`;
+      }
+
+      case "replace_paragraph": {
+        const { paragraph_index, content } = action.params;
+        if (!content || String(content).trim().length === 0) {
+          throw new Error("替换内容为空或仅包含空白字符");
+        }
+        const paragraphs = body.paragraphs;
+        paragraphs.load("items");
+        await context.sync();
+
+        if (paragraph_index < 0 || paragraph_index >= paragraphs.items.length) {
+          throw new Error(`段落序号 ${paragraph_index} 超出范围`);
+        }
+        const para = paragraphs.items[paragraph_index];
+        para.getRange("Whole").insertText(String(content), "Replace");
+        await context.sync();
+        return `已替换段落 ${paragraph_index} 的内容`;
+      }
+
+      case "set_paragraph_style": {
+        const { paragraph_index, format } = action.params;
+        const paragraphs = body.paragraphs;
+        paragraphs.load("items");
+        await context.sync();
+
+        if (paragraph_index < 0 || paragraph_index >= paragraphs.items.length) {
+          throw new Error(`段落序号 ${paragraph_index} 超出范围`);
+        }
+        await applyFormat(paragraphs.items[paragraph_index], format, context);
+        return `已将段落 ${paragraph_index} 设置为 ${format} 格式`;
+      }
+
+      case "merge_paragraphs": {
+        const { first_paragraph_index, second_paragraph_index, separator = " " } = action.params;
+        const paragraphs = body.paragraphs;
+        paragraphs.load("items");
+        await context.sync();
+
+        if (first_paragraph_index < 0 || first_paragraph_index >= paragraphs.items.length) {
+          throw new Error(`第一个段落序号 ${first_paragraph_index} 超出范围`);
+        }
+        if (second_paragraph_index < 0 || second_paragraph_index >= paragraphs.items.length) {
+          throw new Error(`第二个段落序号 ${second_paragraph_index} 超出范围`);
+        }
+        if (first_paragraph_index === second_paragraph_index) {
+          throw new Error("不能合并同一个段落");
+        }
+
+        const firstPara = paragraphs.items[first_paragraph_index];
+        const secondPara = paragraphs.items[second_paragraph_index];
+        firstPara.load("text");
+        secondPara.load("text");
+        await context.sync();
+
+        const mergedText = (firstPara.text || "") + separator + (secondPara.text || "");
+        firstPara.getRange("Whole").insertText(mergedText, "Replace");
+        secondPara.delete();
+        await context.sync();
+        return `已合并段落 ${first_paragraph_index} 和段落 ${second_paragraph_index}`;
+      }
+
+      case "apply_rich_format": {
+        const { target_mode, paragraph_index, font } = action.params;
+        let targetRange: Word.Range;
+
+        if (target_mode === "selection") {
+          targetRange = context.document.getSelection();
+        } else if (target_mode === "paragraph_index") {
+          const paragraphs = body.paragraphs;
+          paragraphs.load("items");
+          await context.sync();
+          if (paragraph_index < 0 || paragraph_index >= paragraphs.items.length) {
+            throw new Error(`段落序号 ${paragraph_index} 超出范围`);
+          }
+          targetRange = paragraphs.items[paragraph_index].getRange("Whole");
+        } else if (target_mode === "last_inserted") {
+          throw new Error("last_inserted 模式暂未实现，请使用 paragraph_index 或 selection");
+        } else {
+          throw new Error(`未知的目标模式: ${target_mode}`);
+        }
+
+        targetRange.load("font");
+        await context.sync();
+
+        if (font) {
+          if (font.name) targetRange.font.name = font.name;
+          if (font.size) targetRange.font.size = font.size;
+          if (font.color) targetRange.font.color = font.color;
+          if (font.bold !== undefined) targetRange.font.bold = font.bold;
+          if (font.italic !== undefined) targetRange.font.italic = font.italic;
+        }
+
+        await context.sync();
+        return "已应用富文本格式";
+      }
+
       case "reply_only":
         // No document operation needed
         return "仅回复文本，无需文档操作";
+
+      case "task_complete":
+        // No document operation needed — this signals agent loop completion
+        return action.params.summary || "任务已完成";
 
       default:
         return `未知操作: ${action.action}`;
@@ -954,17 +1364,27 @@ function stringifyOfficeError(error: unknown): { message: string; details: strin
   return { message, details };
 }
 
-async function executeActionPlan(plan: ActionPlan): Promise<void> {
-  const results: string[] = [];
+async function executeActionPlan(plan: ActionPlan): Promise<Array<{ toolCallId: string; toolName: string; result: string; success: boolean }>> {
+  const results: Array<{ toolCallId: string; toolName: string; result: string; success: boolean }> = [];
 
   for (let i = 0; i < plan.actions.length; i++) {
     const action = plan.actions[i];
     try {
       const result = await executeAction(action);
-      results.push(`✅ ${action.description}: ${result}`);
+      results.push({
+        toolCallId: action.toolCallId ?? `action-${i}`,
+        toolName: action.action,
+        result,
+        success: true,
+      });
     } catch (error) {
       const { message, details } = stringifyOfficeError(error);
-      results.push(`❌ ${action.description}: ${message}`);
+      results.push({
+        toolCallId: action.toolCallId ?? `action-${i}`,
+        toolName: action.action,
+        result: `错误: ${message}`,
+        success: false,
+      });
       console.error(`[executeActionPlan] action ${i + 1} (${action.action}) failed:`, details);
 
       if (plan.actions.length > 1) {
@@ -974,7 +1394,9 @@ async function executeActionPlan(plan: ActionPlan): Promise<void> {
     }
   }
 
-  setStatus(chatStatus, results.join("\n"));
+  const statusLines = results.map((r) => `${r.success ? "✅" : "❌"} ${r.toolName}: ${r.result.slice(0, 100)}`);
+  setStatus(chatStatus, statusLines.join("\n"));
+  return results;
 }
 
 // ─── Action Plan Preview ────────────────────────────────────────────────────
@@ -1019,12 +1441,57 @@ async function confirmActionPlan(): Promise<void> {
   }
 
   const plan = state.pendingActionPlan;
+  const sessionId = state.pendingSessionId;
+  console.log("[confirmActionPlan] plan:", JSON.stringify(plan.actions.map(a => ({ action: a.action, toolCallId: a.toolCallId }))));
+  console.log("[confirmActionPlan] sessionId:", sessionId);
   hideActionPlanPreview();
 
   try {
-    await executeActionPlan(plan);
+    const results = await executeActionPlan(plan);
+    console.log("[confirmActionPlan] executeActionPlan results:", JSON.stringify(results.map(r => ({ toolCallId: r.toolCallId, toolName: r.toolName, success: r.success }))));
+
+    // If this came from the agent loop (has sessionId), continue the loop
+    if (sessionId) {
+      console.log("[confirmActionPlan] Continuing agent loop with sessionId:", sessionId);
+      setStatus(chatStatus, "操作已执行，等待模型继续...");
+
+      const assistantEl = createAssistantMessage("");
+
+      const data = await continueAgentLoop(
+        sessionId,
+        results,
+        (partial) => updateAssistantMessage(assistantEl, partial)
+      );
+
+      // Save assistant reply to session
+      const activeSession = getActiveSession();
+      if (activeSession && data.reply) {
+        activeSession.messages.push({ role: "assistant", content: data.reply });
+        activeSession.updatedAt = Date.now();
+        saveSessionsToStorage();
+      }
+
+      const citationText = data.citations?.length
+        ? `\n\n来源: ${data.citations.map((c) => c.fileName).join(", ")}（命中 ${data.retrievalCount ?? data.citations.length} 段）`
+        : "";
+
+      if (data.actionPlan && data.actionPlan.actions.length > 0) {
+        updateAssistantMessage(assistantEl, `${data.reply}${citationText}\n\n📋 操作计划：${data.actionPlan.explanation}`);
+        showActionPlanPreview(data.actionPlan);
+        state.pendingSessionId = data.sessionId;
+      } else {
+        updateAssistantMessage(assistantEl, `${data.reply}${citationText}`);
+        setStatus(chatStatus, "已完成");
+        state.pendingSessionId = null;
+      }
+    } else {
+      // No sessionId — cannot continue agent loop
+      console.log("[confirmActionPlan] Not continuing agent loop. sessionId:", sessionId);
+      setStatus(chatStatus, "操作已执行（无会话ID，无法继续迭代）");
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
+    console.error("[confirmActionPlan] Error:", message);
     setStatus(chatStatus, `执行操作失败: ${message}`);
   }
 }
@@ -1154,6 +1621,276 @@ type StreamEvent = {
   error?: string;
 };
 
+type AgentStreamEvent =
+  | { type: "start"; ts: number }
+  | { type: "delta"; delta: string }
+  | { type: "tool_call"; tools: Array<{ id: string; tool: string; params: Record<string, any> }> }
+  | { type: "action_plan"; plan: ActionPlan }
+  | { type: "task_complete"; summary: string }
+  | { type: "session"; sessionId: string }
+  | { type: "await_tool_result"; iteration: number }
+  | { type: "fallback"; reason: string }
+  | { type: "done"; reply: string; actionPlan?: ActionPlan | null; sessionId?: string; retrievalCount?: number; citations?: Array<{ fileName: string }> }
+  | { type: "error"; error: string };
+
+async function parseSSEResponse(
+  res: Response,
+  onDelta?: (text: string) => void
+): Promise<AgentStreamEvent[]> {
+  if (!res.ok) {
+    const err = await parseErrorMessage(res);
+    throw new Error(err);
+  }
+
+  if (!res.body) {
+    throw new Error("流式响应不可用");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const events: AgentStreamEvent[] = [];
+  let accumulatedDelta = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() ?? "";
+
+    for (const chunk of chunks) {
+      const line = chunk.split("\n").find((item) => item.trim().startsWith("data:"));
+      if (!line) continue;
+
+      const raw = line.slice(5).trim();
+      if (!raw || raw === "[DONE]") continue;
+
+      let data: AgentStreamEvent;
+      try {
+        data = JSON.parse(raw) as AgentStreamEvent;
+      } catch {
+        continue;
+      }
+
+      events.push(data);
+
+      if (data.type === "delta" && data.delta) {
+        accumulatedDelta += data.delta;
+        onDelta?.(accumulatedDelta);
+      }
+
+      if (data.type === "error") {
+        throw new Error(data.error || "流式响应出错");
+      }
+    }
+  }
+
+  return events;
+}
+
+async function executeSingleTool(
+  tool: { id: string; tool: string; params: Record<string, any> }
+): Promise<{ toolCallId: string; toolName: string; result: string; success: boolean }> {
+  const action: WordAction = {
+    action: tool.tool,
+    params: tool.params,
+    description: `Agent Loop: ${tool.tool}`,
+  };
+
+  try {
+    const result = await executeAction(action);
+    return { toolCallId: tool.id, toolName: tool.tool, result, success: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    return { toolCallId: tool.id, toolName: tool.tool, result: `错误: ${message}`, success: false };
+  }
+}
+
+async function sendAgentMessageStream(
+  payload: {
+    messages: ChatMessage[];
+    documentContext: string;
+    documentStructure?: DocumentStructure;
+    selection: string;
+    insertMode: InsertMode;
+  },
+  onDelta: (text: string) => void,
+  maxIterations = 5
+): Promise<{
+  reply: string;
+  actionPlan: ActionPlan | null;
+  retrievalCount?: number;
+  citations?: Array<{ fileName: string }>;
+  sessionId?: string;
+}> {
+  let sessionId: string | null = null;
+  let toolResults: Array<{ toolCallId: string; toolName: string; result: string; success: boolean }> = [];
+  let iteration = 0;
+  let finalReply = "";
+  let finalActionPlan: ActionPlan | null = null;
+  let finalRetrievalCount = 0;
+  let finalCitations: Array<{ fileName: string }> = [];
+
+  while (iteration < maxIterations) {
+    iteration++;
+
+    let res: Response;
+    if (!sessionId) {
+      // Initial request
+      res = await fetch(`${agentBase}/v1/chat/agent-stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, enableReAct: true, maxIterations }),
+      });
+    } else {
+      // Continue with tool results
+      res = await fetch(`${agentBase}/v1/chat/agent-continue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, toolResults }),
+      });
+      toolResults = [];
+    }
+
+    const events = await parseSSEResponse(res, onDelta);
+
+    let hasToolCall = false;
+    for (const event of events) {
+      if (event.type === "session") {
+        sessionId = event.sessionId;
+      }
+
+      if (event.type === "tool_call") {
+        hasToolCall = true;
+        for (const tool of event.tools) {
+          const perceptionTools = ["read_document", "get_selection_info", "get_document_stats"];
+          if (!perceptionTools.includes(tool.tool)) {
+            // Action tool in agent loop — treat as action_plan
+            const plan: ActionPlan = {
+              actions: event.tools.map((t) => ({
+                action: t.tool,
+                params: t.params,
+                description: `Agent: ${t.tool}`,
+                toolCallId: t.id,
+              })),
+              explanation: `Agent 循环中的操作: ${event.tools.map((t) => t.tool).join(", ")}`,
+            };
+            return { reply: finalReply || plan.explanation, actionPlan: plan, retrievalCount: finalRetrievalCount, citations: finalCitations, sessionId: sessionId ?? undefined };
+          }
+
+          const result = await executeSingleTool(tool);
+          toolResults.push(result);
+        }
+      }
+
+      if (event.type === "action_plan") {
+        return { reply: finalReply || event.plan.explanation, actionPlan: event.plan, retrievalCount: finalRetrievalCount, citations: finalCitations, sessionId: sessionId ?? undefined };
+      }
+
+      if (event.type === "task_complete") {
+        return { reply: event.summary || finalReply, actionPlan: null, retrievalCount: finalRetrievalCount, citations: finalCitations, sessionId: sessionId ?? undefined };
+      }
+
+      if (event.type === "done") {
+        finalReply = event.reply ?? finalReply;
+        finalActionPlan = event.actionPlan ?? finalActionPlan;
+        if (event.retrievalCount !== undefined) finalRetrievalCount = event.retrievalCount;
+        if (event.citations) finalCitations = event.citations;
+        if (event.sessionId) sessionId = event.sessionId;
+      }
+    }
+
+    if (!hasToolCall || toolResults.length === 0) {
+      break;
+    }
+  }
+
+  return { reply: finalReply.trim(), actionPlan: finalActionPlan, retrievalCount: finalRetrievalCount, citations: finalCitations, sessionId: sessionId ?? undefined };
+}
+
+async function continueAgentLoop(
+  sessionId: string,
+  toolResults: Array<{ toolCallId: string; toolName: string; result: string; success: boolean }>,
+  onDelta: (text: string) => void,
+  maxIterations = 5
+): Promise<{
+  reply: string;
+  actionPlan: ActionPlan | null;
+  sessionId: string;
+  retrievalCount?: number;
+  citations?: Array<{ fileName: string }>;
+}> {
+  let iteration = 0;
+  let finalReply = "";
+  let finalActionPlan: ActionPlan | null = null;
+  let finalRetrievalCount = 0;
+  let finalCitations: Array<{ fileName: string }> = [];
+  let currentToolResults = [...toolResults];
+  console.log("[continueAgentLoop] Starting with sessionId:", sessionId, "toolResults:", JSON.stringify(toolResults.map(r => ({ toolCallId: r.toolCallId, toolName: r.toolName, success: r.success }))));
+
+  while (iteration < maxIterations) {
+    iteration++;
+    console.log("[continueAgentLoop] Iteration:", iteration);
+
+    const res = await fetch(`${agentBase}/v1/chat/agent-continue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, toolResults: currentToolResults }),
+    });
+
+    currentToolResults = [];
+
+    const events = await parseSSEResponse(res, onDelta);
+
+    let hasToolCall = false;
+    for (const event of events) {
+      if (event.type === "tool_call") {
+        hasToolCall = true;
+        const perceptionTools = ["read_document", "get_selection_info", "get_document_stats"];
+        for (const tool of event.tools) {
+          if (!perceptionTools.includes(tool.tool)) {
+            const plan: ActionPlan = {
+              actions: event.tools.map((t) => ({
+                action: t.tool,
+                params: t.params,
+                description: `Agent: ${t.tool}`,
+                toolCallId: t.id,
+              })),
+              explanation: `Agent 循环中的操作: ${event.tools.map((t) => t.tool).join(", ")}`,
+            };
+            return { reply: finalReply || plan.explanation, actionPlan: plan, sessionId, retrievalCount: finalRetrievalCount, citations: finalCitations };
+          }
+          const result = await executeSingleTool(tool);
+          currentToolResults.push(result);
+        }
+      }
+
+      if (event.type === "action_plan") {
+        return { reply: finalReply || event.plan.explanation, actionPlan: event.plan, sessionId, retrievalCount: finalRetrievalCount, citations: finalCitations };
+      }
+
+      if (event.type === "task_complete") {
+        return { reply: event.summary || finalReply, actionPlan: null, sessionId, retrievalCount: finalRetrievalCount, citations: finalCitations };
+      }
+
+      if (event.type === "done") {
+        finalReply = event.reply ?? finalReply;
+        finalActionPlan = event.actionPlan ?? finalActionPlan;
+        if (event.retrievalCount !== undefined) finalRetrievalCount = event.retrievalCount;
+        if (event.citations) finalCitations = event.citations;
+      }
+    }
+
+    if (!hasToolCall || currentToolResults.length === 0) {
+      break;
+    }
+  }
+
+  return { reply: finalReply.trim(), actionPlan: finalActionPlan, sessionId, retrievalCount: finalRetrievalCount, citations: finalCitations };
+}
+
 async function sendMessageStream(
   payload: {
     messages: ChatMessage[];
@@ -1168,6 +1905,7 @@ async function sendMessageStream(
   actionPlan: ActionPlan | null;
   retrievalCount?: number;
   citations?: Array<{ fileName: string }>;
+  sessionId?: string;
 }> {
   const res = await fetch(`${agentBase}/v1/chat/stream`, {
     method: "POST",
@@ -1291,18 +2029,47 @@ async function sendMessage(): Promise<void> {
 
   try {
     const assistantEl = createAssistantMessage("");
-    const data = await sendMessageStream(
-      {
-        messages: [{ role: "user", content: llmPrompt }],
-        documentContext: wordContext.documentContext,
-        documentStructure: wordStructure,
-        selection: wordContext.selection,
-        insertMode,
-      },
-      (partial) => {
-        updateAssistantMessage(assistantEl, partial);
-      }
-    );
+
+    // Use Agent Loop for smart_action mode, fallback to legacy stream for others
+    const useAgentLoop = insertMode === "smart_action";
+
+    // Build messages for LLM: full session history with enriched last user message
+    const messagesForLlm: ChatMessage[] = activeSession.messages.map((m) => ({ ...m }));
+    const lastIdx = messagesForLlm.length - 1;
+    if (lastIdx >= 0 && messagesForLlm[lastIdx].role === "user") {
+      messagesForLlm[lastIdx] = { role: "user", content: llmPrompt };
+    } else {
+      messagesForLlm.push({ role: "user", content: llmPrompt });
+    }
+
+    const data = useAgentLoop
+      ? await sendAgentMessageStream(
+          {
+            messages: messagesForLlm,
+            documentContext: wordContext.documentContext,
+            documentStructure: wordStructure,
+            selection: wordContext.selection,
+            insertMode,
+          },
+          (partial) => {
+            updateAssistantMessage(assistantEl, partial);
+          }
+        )
+      : await sendMessageStream(
+          {
+            messages: messagesForLlm,
+            documentContext: wordContext.documentContext,
+            documentStructure: wordStructure,
+            selection: wordContext.selection,
+            insertMode,
+          },
+          (partial) => {
+            updateAssistantMessage(assistantEl, partial);
+          }
+        );
+
+    state.pendingSessionId = data.sessionId ?? null;
+    console.log("[sendMessage] pendingSessionId set to:", state.pendingSessionId, "actionPlan:", data.actionPlan ? `actions=${data.actionPlan.actions.length}` : "null");
 
     state.lastReply = data.reply;
     activeSession.messages.push({ role: "assistant", content: data.reply });

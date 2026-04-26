@@ -4,6 +4,6 @@
   "model": "Qwen3.5-9B.Q5_K_M.gguf",
   "temperature": 0.2,
   "maxTokens": 65535,
-  "firstTokenTimeout": 60,
-  "overallTimeout": 240
+  "firstTokenTimeout": 120,
+  "overallTimeout": 480
 }
