@@ -85,6 +85,20 @@ export const WORD_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "get_paragraph_format",
+      description: "获取指定段落的详细格式信息，包括段落内每个文本片段（run）的字体、字号、加粗、斜体、颜色。当需要精确了解段落内的内联格式变化时使用（例如：段落中部分文字使用了不同字体或加粗）。返回 paragraphFont（段落默认字体）和 runs 数组（每个 run 有独立字体信息）。如果 runs 只有 1 个，说明全段格式统一。",
+      parameters: {
+        type: "object",
+        properties: {
+          paragraph_index: { type: "number", description: "要查看格式的段落序号（从0开始）" },
+        },
+        required: ["paragraph_index"],
+      },
+    },
+  },
 
   // --- 操作类工具 (Action) ---
   {
@@ -96,11 +110,12 @@ export const WORD_TOOLS: ToolDefinition[] = [
         type: "object",
         properties: {
           heading_text: { type: "string", description: "要查找的标题文本" },
-          content: { type: "string", description: "要插入的内容（纯文本，不要使用 Markdown 标记）" },
+          content: { type: "string", description: "要插入的内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式（如 <b>加粗</b>、<i>斜体</i>、<span style='font-family:黑体;font-size:14pt'>指定字体</span>）" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
           format: {
             type: "string",
             enum: ["normal", "heading1", "heading2", "heading3", "bullet_list", "numbered_list"],
-            description: "插入内容的格式，默认为 normal",
+            description: "段落级别样式，默认为 normal。注意：content_format='html' 时此参数仍可用于设置段落样式",
           },
         },
         required: ["heading_text", "content"],
@@ -115,11 +130,12 @@ export const WORD_TOOLS: ToolDefinition[] = [
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "要插入的内容（纯文本，不要使用 Markdown 标记）" },
+          content: { type: "string", description: "要插入的内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式（如 <b>加粗</b>、<i>斜体</i>、<span style='font-family:黑体;font-size:14pt'>指定字体</span>）" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
           format: {
             type: "string",
             enum: ["normal", "heading1", "heading2", "heading3", "bullet_list", "numbered_list"],
-            description: "插入内容的格式，默认为 normal",
+            description: "段落级别样式，默认为 normal",
           },
         },
         required: ["content"],
@@ -134,11 +150,12 @@ export const WORD_TOOLS: ToolDefinition[] = [
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "替换后的新内容（纯文本，不要使用 Markdown 标记）" },
+          content: { type: "string", description: "替换后的新内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
           format: {
             type: "string",
             enum: ["normal", "heading1", "heading2", "heading3", "bullet_list", "numbered_list"],
-            description: "替换内容的格式，默认为 normal",
+            description: "段落级别样式，默认为 normal",
           },
         },
         required: ["content"],
@@ -153,11 +170,12 @@ export const WORD_TOOLS: ToolDefinition[] = [
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "要追加的内容（纯文本，不要使用 Markdown 标记）" },
+          content: { type: "string", description: "要追加的内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
           format: {
             type: "string",
             enum: ["normal", "heading1", "heading2", "heading3", "bullet_list", "numbered_list"],
-            description: "追加内容的格式，默认为 normal",
+            description: "段落级别样式，默认为 normal",
           },
         },
         required: ["content"],
@@ -172,11 +190,12 @@ export const WORD_TOOLS: ToolDefinition[] = [
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "要插入的内容（纯文本，不要使用 Markdown 标记）" },
+          content: { type: "string", description: "要插入的内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
           format: {
             type: "string",
             enum: ["normal", "heading1", "heading2", "heading3", "bullet_list", "numbered_list"],
-            description: "插入内容的格式，默认为 normal",
+            description: "段落级别样式，默认为 normal",
           },
         },
         required: ["content"],
@@ -192,11 +211,12 @@ export const WORD_TOOLS: ToolDefinition[] = [
         type: "object",
         properties: {
           paragraph_index: { type: "number", description: "目标段落的序号（从文档结构中获取，从0开始）" },
-          content: { type: "string", description: "要插入的内容（纯文本，不要使用 Markdown 标记）" },
+          content: { type: "string", description: "要插入的内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
           format: {
             type: "string",
             enum: ["normal", "heading1", "heading2", "heading3", "bullet_list", "numbered_list"],
-            description: "插入内容的格式，默认为 normal",
+            description: "段落级别样式，默认为 normal",
           },
         },
         required: ["paragraph_index", "content"],
@@ -254,7 +274,7 @@ export const WORD_TOOLS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "apply_rich_format",
-      description: "对指定段落或选区应用富文本格式（字体、颜色、加粗、斜体、超链接）。用于在插入内容后进一步设置内联格式。",
+      description: "对指定段落或选区应用富文本格式（字体、颜色、加粗、斜体、超链接）。支持对段落内特定文字片段（通过 text_to_format 精确匹配）单独设置格式，实现段落内混合排版。",
       parameters: {
         type: "object",
         properties: {
@@ -264,6 +284,7 @@ export const WORD_TOOLS: ToolDefinition[] = [
             description: "目标：selection=当前选区；paragraph_index=指定段落；last_inserted=上次插入的段落",
           },
           paragraph_index: { type: "number", description: "target_mode=paragraph_index 时的段落序号" },
+          text_to_format: { type: "string", description: "段落内要格式化的精确文本片段。指定后只对该文本应用格式，而非整个段落/选区。例如段落中'重点内容'三个字需要加粗，则填'重点内容'" },
           font: {
             type: "object",
             properties: {
@@ -295,7 +316,8 @@ export const WORD_TOOLS: ToolDefinition[] = [
         type: "object",
         properties: {
           paragraph_index: { type: "number", description: "要替换的段落序号（从0开始）" },
-          content: { type: "string", description: "替换后的新文本内容" },
+          content: { type: "string", description: "替换后的新内容。默认纯文本；当 content_format='html' 时可使用 HTML 标签实现内联格式" },
+          content_format: { type: "string", enum: ["text", "html"], description: "内容格式：text=纯文本（默认），html=HTML格式（支持内联格式标签）" },
         },
         required: ["paragraph_index", "content"],
       },
@@ -368,10 +390,21 @@ export const WORD_TOOLS: ToolDefinition[] = [
 
 // --- Build document structure description ---
 
+function describeFontBrief(font?: { name?: string; size?: number; color?: string; bold?: boolean; italic?: boolean }): string {
+  if (!font) return "";
+  const parts: string[] = [];
+  if (font.name) parts.push(font.name);
+  if (font.size) parts.push(`${font.size}pt`);
+  if (font.bold) parts.push("加粗");
+  if (font.italic) parts.push("斜体");
+  if (font.color && !["#000000", "#000000ff", "#000"].includes(font.color.toLowerCase())) parts.push(font.color);
+  return parts.length > 0 ? ` [${parts.join(" ")}]` : "";
+}
+
 export function describeDocumentStructure(structure: {
   totalParagraphs: number;
   totalCharacters?: number;
-  paragraphs: Array<{ index: number; text: string; style: string; headingLevel?: number; isList: boolean; charCount?: number }>;
+  paragraphs: Array<{ index: number; text: string; style: string; headingLevel?: number; isList: boolean; charCount?: number; font?: { name?: string; size?: number; color?: string; bold?: boolean; italic?: boolean } }>;
   selection: { text: string; startParagraphIndex?: number; endParagraphIndex?: number };
 }): string {
   const lines: string[] = [];
@@ -379,12 +412,13 @@ export function describeDocumentStructure(structure: {
 
   for (const p of structure.paragraphs) {
     const charInfo = p.charCount ? `(${p.charCount}字)` : "";
+    const fontInfo = describeFontBrief(p.font);
     if (p.headingLevel) {
-      lines.push(`  ${"#".repeat(p.headingLevel)} [段落${p.index}]${charInfo} ${p.text}`);
+      lines.push(`  ${"#".repeat(p.headingLevel)} [段落${p.index}]${charInfo}${fontInfo} ${p.text}`);
     } else if (p.isList) {
-      lines.push(`  - [段落${p.index}]${charInfo} ${p.text}`);
+      lines.push(`  - [段落${p.index}]${charInfo}${fontInfo} ${p.text}`);
     } else {
-      lines.push(`  [段落${p.index}]${charInfo} ${p.text.slice(0, 100)}`);
+      lines.push(`  [段落${p.index}]${charInfo}${fontInfo} ${p.text.slice(0, 100)}`);
     }
   }
 
@@ -396,6 +430,8 @@ export function describeDocumentStructure(structure: {
   } else {
     lines.push(`\n当前无选中文本（光标模式）`);
   }
+
+  lines.push(`\n注意：以上字体为段落级别默认字体。Word 支持段落内内联格式变化（如部分文字使用不同字体、加粗等），如需查看某段落的详细格式分布，请使用 get_paragraph_format 工具。`);
 
   return lines.join("\n");
 }
@@ -422,7 +458,8 @@ function buildSystemPrompt(
 - 如果不确定文档当前状态、目标位置、或索引是否有效，先调用 read_document 或 get_selection_info 确认
 - 插入/删除操作后段落索引会变化，后续操作应基于新的索引
 - 如果 find_and_replace_v2 返回 replaced=0，说明查找失败，不要继续基于该假设执行后续操作
-- content 参数必须是非空字符串`;
+- content 参数必须是非空字符串
+- 注意：段落级别字体信息只是该段落的默认/主字体。Word 文档支持在同一段落内对不同文字片段设置不同格式（内联格式），如需精确了解段落内的格式分布（例如某段落中部分文字加粗、部分使用不同字体），请使用 get_paragraph_format 工具获取逐片段的格式详情`;
 
   if (hasTools) {
     content += `
@@ -433,6 +470,7 @@ function buildSystemPrompt(
 - read_document: 动态读取文档片段（按段落范围、标题上下文、选区、光标周围）
 - get_selection_info: 获取当前选区精确信息（文本、段落索引、是否仅为光标）
 - get_document_stats: 获取文档统计信息（总段落数、字符数、标题列表）
+- get_paragraph_format: 获取指定段落的详细格式信息（段落内每个文本片段的字体、字号、加粗、斜体、颜色），用于检测内联格式变化
 
 ### 操作类工具（用于修改文档）
 - insert_after_heading: 在指定标题后插入新内容
@@ -455,7 +493,8 @@ function buildSystemPrompt(
 - 定位内容：优先使用 find_and_replace_v2 或 read_document(mode="heading_context")，而非依赖可能过时的 paragraph_index
 - 插入内容：光标处插入 → insert_at_cursor；标题后插入 → insert_after_heading；文末 → insert_at_end；文首 → insert_at_start
 - 修改内容：替换整段 → replace_paragraph；修改文字 → find_and_replace_v2；改样式 → set_paragraph_style
-- 格式控制：format 参数只控制段落级别样式。如需内联格式（加粗、颜色、超链接），在插入后使用 apply_rich_format
+- 格式控制：format 参数只控制段落级别样式（标题、列表等）。插入工具支持 content_format="html"，可直接在 content 中使用 HTML 标签实现内联格式（如 <b>加粗</b>、<i>斜体</i>、<span style="font-family:黑体;font-size:14pt">指定字体</span>）。对已有文本的局部格式化，使用 apply_rich_format 配合 text_to_format 参数精确匹配目标文字
+- 混合格式插入示例：content_format="html", content="这是<b>重点内容</b>和<i>斜体内容</i>的混合段落"
 - 不确定时：先 read_document 确认位置和内容，再执行操作
 
 ### 任务完成规则
@@ -579,19 +618,21 @@ function describeAction(actionName: string, params: Record<string, any>): string
       return "获取当前选区信息";
     case "get_document_stats":
       return "获取文档统计信息";
+    case "get_paragraph_format":
+      return `获取段落${params.paragraph_index}的详细格式`;
     // 操作类工具
     case "insert_after_heading":
-      return `在标题"${params.heading_text}"后插入内容${fmtSuffix}`;
+      return `在标题"${params.heading_text}"后插入${params.content_format === "html" ? "HTML格式" : ""}内容${fmtSuffix}`;
     case "insert_at_cursor":
-      return `在光标处插入内容${fmtSuffix}`;
+      return `在光标处插入${params.content_format === "html" ? "HTML格式" : ""}内容${fmtSuffix}`;
     case "replace_selection":
-      return `替换选区内容${fmtSuffix}`;
+      return `替换选区${params.content_format === "html" ? "HTML格式" : ""}内容${fmtSuffix}`;
     case "insert_at_end":
-      return `追加内容到文档末尾${fmtSuffix}`;
+      return `追加${params.content_format === "html" ? "HTML格式" : ""}内容到文档末尾${fmtSuffix}`;
     case "insert_at_start":
-      return `插入内容到文档开头${fmtSuffix}`;
+      return `插入${params.content_format === "html" ? "HTML格式" : ""}内容到文档开头${fmtSuffix}`;
     case "insert_after_paragraph":
-      return `在段落${params.paragraph_index}后插入内容${fmtSuffix}`;
+      return `在段落${params.paragraph_index}后插入${params.content_format === "html" ? "HTML格式" : ""}内容${fmtSuffix}`;
     case "delete_paragraph":
       return `删除段落${params.paragraph_index}`;
     case "find_and_replace":
@@ -600,9 +641,10 @@ function describeAction(actionName: string, params: Record<string, any>): string
       return `查找替换"${params.find_text}"→"${params.replace_text}"${params.replace_all ? "（全部）" : "（首处）"}${params.match_case ? " 区分大小写" : ""}`;
     case "apply_rich_format":
       if (params.hyperlink) return `对${params.target_mode}应用超链接"${params.hyperlink.text}"`;
+      if (params.text_to_format) return `对段落内文本"${params.text_to_format}"应用富文本格式`;
       return `对${params.target_mode}应用富文本格式`;
     case "replace_paragraph":
-      return `替换段落${params.paragraph_index}的内容`;
+      return `替换段落${params.paragraph_index}的内容${params.content_format === "html" ? "（HTML格式）" : ""}`;
     case "set_paragraph_style":
       return `将段落${params.paragraph_index}设置为${params.format}格式`;
     case "merge_paragraphs":
@@ -755,7 +797,7 @@ export async function callOpenAICompatible(
 
 // Helper to check if an action plan contains only perception tools
 export function isPerceptionOnlyPlan(plan: ActionPlan): boolean {
-  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats"];
+  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
   return plan.actions.length > 0 && plan.actions.every((a) => perceptionTools.includes(a.action));
 }
 

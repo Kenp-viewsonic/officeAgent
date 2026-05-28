@@ -14,6 +14,13 @@ type DocumentParagraph = {
   headingLevel?: number;
   isTable: boolean;
   isList: boolean;
+  font?: {
+    name?: string;
+    size?: number;
+    color?: string;
+    bold?: boolean;
+    italic?: boolean;
+  };
 };
 
 type DocumentStructure = {
@@ -686,6 +693,7 @@ async function getStructuredContext(): Promise<DocumentStructure> {
       for (let i = 0; i < Math.min(paragraphs.items.length, MAX_PARAGRAPHS); i++) {
         const p = paragraphs.items[i];
         p.load(["text", "style", "isListItem"]);
+        p.font.load(["name", "size", "color", "bold", "italic"]);
       }
       await context.sync();
 
@@ -696,6 +704,12 @@ async function getStructuredContext(): Promise<DocumentStructure> {
 
         const style = (p.style || "Normal").toString();
         const headingMatch = style.match(/Heading\s*(\d)/i);
+        const fontName = p.font.name || undefined;
+        const fontSize = p.font.size || undefined;
+        const fontColor = p.font.color || undefined;
+        const fontBold = p.font.bold === true ? true : undefined;
+        const fontItalic = p.font.italic === true ? true : undefined;
+        const hasFont = fontName || fontSize || fontColor || fontBold || fontItalic;
         paraList.push({
           index: i,
           text: text.slice(0, MAX_TEXT_LENGTH),
@@ -703,6 +717,7 @@ async function getStructuredContext(): Promise<DocumentStructure> {
           headingLevel: headingMatch ? parseInt(headingMatch[1]) : undefined,
           isTable: false,
           isList: p.isListItem,
+          font: hasFont ? { name: fontName, size: fontSize, color: fontColor, bold: fontBold, italic: fontItalic } : undefined,
         });
       }
 
@@ -810,6 +825,7 @@ async function readDocument(params: Record<string, any>): Promise<string> {
         for (let i = start; i < Math.min(start + count, paragraphs.items.length); i++) {
           const p = paragraphs.items[i];
           p.load(["text", "style", "isListItem"]);
+          p.font.load(["name", "size", "color", "bold", "italic"]);
         }
         await context.sync();
 
@@ -818,7 +834,14 @@ async function readDocument(params: Record<string, any>): Promise<string> {
           const style = (p.style || "Normal").toString();
           const headingMatch = style.match(/Heading\s*(\d)/i);
           const headingLevel = headingMatch ? parseInt(headingMatch[1]) : undefined;
-          result.push(`[段落${i}] ${headingLevel ? `标题${headingLevel} ` : ""}${p.text || ""}`);
+          const fontParts: string[] = [];
+          if (p.font.name) fontParts.push(p.font.name);
+          if (p.font.size) fontParts.push(`${p.font.size}pt`);
+          if (p.font.bold) fontParts.push("加粗");
+          if (p.font.italic) fontParts.push("斜体");
+          if (p.font.color && !["#000000", "#000000ff", "#000"].includes((p.font.color || "").toLowerCase())) fontParts.push(p.font.color);
+          const fontStr = fontParts.length > 0 ? ` [${fontParts.join(" ")}]` : "";
+          result.push(`[段落${i}] ${headingLevel ? `标题${headingLevel} ` : ""}${p.text || ""}${fontStr}`);
         }
 
         return result.length
@@ -1006,6 +1029,118 @@ async function getDocumentStats(): Promise<string> {
   });
 }
 
+// ─── Run-Level Format Parsing ───────────────────────────────────────────────
+
+type RunInfo = {
+  text: string;
+  font?: { name?: string; size?: string; bold?: boolean; italic?: boolean; color?: string };
+};
+
+function parseRunsFromHtml(html: string): RunInfo[] {
+  const runs: RunInfo[] = [];
+
+  // Match <span style="...">text</span> patterns (Word getHtml produces these)
+  const spanRegex = /<span[^>]*style="([^"]*)"[^>]*>([\s\S]*?)<\/span>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = spanRegex.exec(html)) !== null) {
+    const style = match[1];
+    // Strip any inner HTML tags from the text content
+    const text = match[2].replace(/<[^>]+>/g, "").trim();
+    if (!text) continue;
+
+    const font: RunInfo["font"] = {};
+    const nameMatch = style.match(/font-family:\s*([^;]+)/i);
+    if (nameMatch) font!.name = nameMatch[1].replace(/['"]/g, "").trim();
+
+    const sizeMatch = style.match(/font-size:\s*([^;]+)/i);
+    if (sizeMatch) font!.size = sizeMatch[1].trim();
+
+    if (/font-weight:\s*(bold|700)/i.test(style)) font!.bold = true;
+    if (/font-style:\s*italic/i.test(style)) font!.italic = true;
+
+    const colorMatch = style.match(/(?:^|[^-])color:\s*([^;]+)/i);
+    if (colorMatch) font!.color = colorMatch[1].trim();
+
+    const hasFont = font!.name || font!.size || font!.bold || font!.italic || font!.color;
+    runs.push({ text, font: hasFont ? font : undefined });
+  }
+
+  // Fallback: if no <span> found, extract plain text from <p> or body
+  if (runs.length === 0) {
+    const plainText = html.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").trim();
+    if (plainText) {
+      // Split by meaningful chunks (preserve line breaks as separate runs)
+      const lines = plainText.split(/\n/).filter((l) => l.trim());
+      for (const line of lines) {
+        runs.push({ text: line.trim() });
+      }
+    }
+  }
+
+  return runs;
+}
+
+async function getParagraphFormat(params: Record<string, any>): Promise<string> {
+  const { paragraph_index } = params;
+  if (typeof Word === "undefined") {
+    throw new Error("当前不在 Word 宿主中");
+  }
+
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    const paragraphs = body.paragraphs;
+    paragraphs.load("items");
+    await context.sync();
+
+    if (paragraph_index < 0 || paragraph_index >= paragraphs.items.length) {
+      throw new Error(`段落序号 ${paragraph_index} 超出范围（共 ${paragraphs.items.length} 段）`);
+    }
+
+    const para = paragraphs.items[paragraph_index];
+    para.load(["text", "style", "isListItem"]);
+    para.font.load(["name", "size", "color", "bold", "italic"]);
+
+    const range = para.getRange("Whole");
+    const htmlResult = range.getHtml();
+    await context.sync();
+
+    const style = (para.style || "Normal").toString();
+    const headingMatch = style.match(/Heading\s*(\d)/i);
+
+    const paragraphFont: Record<string, any> = {};
+    if (para.font.name) paragraphFont.name = para.font.name;
+    if (para.font.size) paragraphFont.size = para.font.size;
+    if (para.font.color) paragraphFont.color = para.font.color;
+    if (para.font.bold === true) paragraphFont.bold = true;
+    if (para.font.italic === true) paragraphFont.italic = true;
+
+    const runs = parseRunsFromHtml(htmlResult.value);
+    const hasMixedFormatting = runs.length > 1 && runs.some((r) => r.font && Object.keys(r.font).length > 0);
+
+    const result: Record<string, any> = {
+      paragraphIndex: paragraph_index,
+      text: (para.text || "").slice(0, 1000),
+      style,
+      headingLevel: headingMatch ? parseInt(headingMatch[1]) : undefined,
+      isListItem: para.isListItem,
+      paragraphFont: Object.keys(paragraphFont).length > 0 ? paragraphFont : undefined,
+      hasMixedFormatting,
+    };
+
+    // Only include runs detail when there's mixed formatting or multiple runs
+    if (runs.length > 0) {
+      result.runs = runs.map((r) => {
+        const runInfo: Record<string, any> = { text: r.text.length > 200 ? r.text.slice(0, 200) + "..." : r.text };
+        if (r.font) runInfo.font = r.font;
+        return runInfo;
+      });
+    }
+
+    return JSON.stringify(result, null, 2);
+  });
+}
+
 // ─── Word Action Execution ───────────────────────────────────────────────────
 
 async function applyFormat(
@@ -1053,10 +1188,11 @@ async function executeAction(action: WordAction): Promise<string> {
 
     switch (action.action) {
       case "insert_after_heading": {
-        const { heading_text, content, format = "normal" } = action.params;
+        const { heading_text, content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
           throw new Error("插入内容为空或仅包含空白字符");
         }
+        const isHtml = content_format === "html";
         const matches = body.search(heading_text, { matchCase: false, matchWholeWord: false });
         matches.load("items");
         await context.sync();
@@ -1065,13 +1201,22 @@ async function executeAction(action: WordAction): Promise<string> {
           const range = matches.items[0];
           const paragraph = range.paragraphs.getFirst();
           paragraph.load("text,style,isListItem");
+          if (isHtml) {
+            paragraph.getRange("End").insertHtml(String(content), "After");
+            await context.sync();
+            return `已在"${heading_text}"后插入 HTML 格式内容`;
+          }
           const newPara = paragraph.insertParagraph(content, "After");
           await context.sync();
           await applyFormat(newPara, format, context);
           return `已在"${heading_text}"后插入内容`;
         }
-        // Fallback: insert at end
         const lastPara = body.paragraphs.getLast();
+        if (isHtml) {
+          lastPara.getRange("End").insertHtml(String(content), "After");
+          await context.sync();
+          return `未找到标题"${heading_text}"，已插入 HTML 格式内容到文档末尾`;
+        }
         const newPara = lastPara.insertParagraph(content, "After");
         await context.sync();
         await applyFormat(newPara, format, context);
@@ -1079,11 +1224,16 @@ async function executeAction(action: WordAction): Promise<string> {
       }
 
       case "replace_selection": {
-        const { content, format = "normal" } = action.params;
+        const { content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
           throw new Error("替换内容为空或仅包含空白字符");
         }
         const selection = context.document.getSelection();
+        if (content_format === "html") {
+          selection.insertHtml(String(content), "Replace");
+          await context.sync();
+          return "已替换选区内容（HTML 格式）";
+        }
         const para = selection.insertParagraph(content, "Replace");
         await context.sync();
         await applyFormat(para, format, context);
@@ -1091,9 +1241,18 @@ async function executeAction(action: WordAction): Promise<string> {
       }
 
       case "insert_at_end": {
-        const { content, format = "normal" } = action.params;
+        const { content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
           throw new Error("插入内容为空或仅包含空白字符");
+        }
+        if (content_format === "html") {
+          try {
+            body.paragraphs.getLast().getRange("End").insertHtml(String(content), "After");
+          } catch {
+            body.insertHtml(String(content), "End");
+          }
+          await context.sync();
+          return "已追加 HTML 格式内容到文档末尾";
         }
         let newPara: Word.Paragraph;
         try {
@@ -1108,48 +1267,60 @@ async function executeAction(action: WordAction): Promise<string> {
       }
 
       case "insert_at_start": {
-        const { content, format = "normal" } = action.params;
-        console.log("[DEBUG insert_at_start] content length:", content?.length, "format:", format, "content preview:", JSON.stringify(content?.slice(0, 50)));
-
+        const { content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
-          throw new Error("插入内容为空或仅包含空白字符 (content is empty)");
+          throw new Error("插入内容为空或仅包含空白字符");
         }
-
+        if (content_format === "html") {
+          try {
+            body.paragraphs.getFirst().getRange("Start").insertHtml(String(content), "Before");
+          } catch {
+            body.insertHtml(String(content), "Start");
+          }
+          await context.sync();
+          return "已插入 HTML 格式内容到文档开头";
+        }
         let newPara: Word.Paragraph;
         try {
           const firstPara = body.paragraphs.getFirst();
           firstPara.load("text");
           await context.sync();
-          console.log("[DEBUG insert_at_start] firstPara.text:", JSON.stringify(firstPara.text));
           newPara = firstPara.insertParagraph(String(content), "Before");
         } catch (e) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          console.log("[DEBUG insert_at_start] getFirst failed, fallback to body.insertParagraph(Start):", errMsg);
           newPara = body.insertParagraph(String(content), "Start");
         }
         await context.sync();
         await applyFormat(newPara, format, context);
-        console.log("[DEBUG insert_at_start] success");
         return "已插入到文档开头";
       }
 
       case "insert_after_paragraph": {
-        const { paragraph_index, content, format = "normal" } = action.params;
+        const { paragraph_index, content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
           throw new Error("插入内容为空或仅包含空白字符");
         }
+        const isHtml = content_format === "html";
         const paragraphs = body.paragraphs;
         paragraphs.load("items");
         await context.sync();
 
         if (paragraph_index >= 0 && paragraph_index < paragraphs.items.length) {
+          if (isHtml) {
+            paragraphs.items[paragraph_index].getRange("End").insertHtml(String(content), "After");
+            await context.sync();
+            return `已在段落 ${paragraph_index} 后插入 HTML 格式内容`;
+          }
           const newPara = paragraphs.items[paragraph_index].insertParagraph(content, "After");
           await context.sync();
           await applyFormat(newPara, format, context);
           return `已在段落 ${paragraph_index} 后插入内容`;
         }
-        // Fallback: insert at end
         const lastPara = body.paragraphs.getLast();
+        if (isHtml) {
+          lastPara.getRange("End").insertHtml(String(content), "After");
+          await context.sync();
+          return `段落序号 ${paragraph_index} 超出范围，已插入 HTML 格式内容到末尾`;
+        }
         const newPara = lastPara.insertParagraph(content, "After");
         await context.sync();
         await applyFormat(newPara, format, context);
@@ -1200,12 +1371,22 @@ async function executeAction(action: WordAction): Promise<string> {
         return result;
       }
 
+      case "get_paragraph_format": {
+        const result = await getParagraphFormat(action.params);
+        return result;
+      }
+
       case "insert_at_cursor": {
-        const { content, format = "normal" } = action.params;
+        const { content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
           throw new Error("插入内容为空或仅包含空白字符");
         }
         const selection = context.document.getSelection();
+        if (content_format === "html") {
+          selection.insertHtml(String(content), "Replace");
+          await context.sync();
+          return "已在光标处插入 HTML 格式内容";
+        }
         const para = selection.insertParagraph(String(content), "Replace");
         await context.sync();
         await applyFormat(para, format, context);
@@ -1229,7 +1410,7 @@ async function executeAction(action: WordAction): Promise<string> {
       }
 
       case "replace_paragraph": {
-        const { paragraph_index, content } = action.params;
+        const { paragraph_index, content, content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
           throw new Error("替换内容为空或仅包含空白字符");
         }
@@ -1241,6 +1422,11 @@ async function executeAction(action: WordAction): Promise<string> {
           throw new Error(`段落序号 ${paragraph_index} 超出范围`);
         }
         const para = paragraphs.items[paragraph_index];
+        if (content_format === "html") {
+          para.getRange("Whole").insertHtml(String(content), "Replace");
+          await context.sync();
+          return `已替换段落 ${paragraph_index} 的内容（HTML 格式）`;
+        }
         para.getRange("Whole").insertText(String(content), "Replace");
         await context.sync();
         return `已替换段落 ${paragraph_index} 的内容`;
@@ -1289,7 +1475,7 @@ async function executeAction(action: WordAction): Promise<string> {
       }
 
       case "apply_rich_format": {
-        const { target_mode, paragraph_index, font } = action.params;
+        const { target_mode, paragraph_index, font, text_to_format } = action.params;
         let targetRange: Word.Range;
 
         if (target_mode === "selection") {
@@ -1308,6 +1494,17 @@ async function executeAction(action: WordAction): Promise<string> {
           throw new Error(`未知的目标模式: ${target_mode}`);
         }
 
+        if (text_to_format) {
+          const found = targetRange.search(text_to_format, { matchCase: true });
+          found.load("items");
+          await context.sync();
+          if (found.items.length > 0) {
+            targetRange = found.items[0];
+          } else {
+            throw new Error(`在目标范围内未找到文本"${text_to_format}"，请确认文本完全匹配（区分大小写）`);
+          }
+        }
+
         targetRange.load("font");
         await context.sync();
 
@@ -1320,7 +1517,9 @@ async function executeAction(action: WordAction): Promise<string> {
         }
 
         await context.sync();
-        return "已应用富文本格式";
+        return text_to_format
+          ? `已对文本"${text_to_format}"应用富文本格式`
+          : "已应用富文本格式";
       }
 
       case "reply_only":
@@ -1745,11 +1944,12 @@ async function sendAgentMessageStream(
         body: JSON.stringify({ ...payload, enableReAct: true, maxIterations }),
       });
     } else {
-      // Continue with tool results
+      // Continue with tool results — re-read fresh document structure
+      const freshDocStructure = await getStructuredContext();
       res = await fetch(`${agentBase}/v1/chat/agent-continue`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId, toolResults }),
+        body: JSON.stringify({ sessionId, toolResults, documentStructure: freshDocStructure }),
       });
       toolResults = [];
     }
@@ -1765,7 +1965,7 @@ async function sendAgentMessageStream(
       if (event.type === "tool_call") {
         hasToolCall = true;
         for (const tool of event.tools) {
-          const perceptionTools = ["read_document", "get_selection_info", "get_document_stats"];
+          const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
           if (!perceptionTools.includes(tool.tool)) {
             // Action tool in agent loop — treat as action_plan
             const plan: ActionPlan = {
@@ -1834,10 +2034,13 @@ async function continueAgentLoop(
     iteration++;
     console.log("[continueAgentLoop] Iteration:", iteration);
 
+    // Re-read fresh document structure after tool execution so LLM sees updated state
+    const freshDocStructure = await getStructuredContext();
+
     const res = await fetch(`${agentBase}/v1/chat/agent-continue`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, toolResults: currentToolResults }),
+      body: JSON.stringify({ sessionId, toolResults: currentToolResults, documentStructure: freshDocStructure }),
     });
 
     currentToolResults = [];
@@ -1848,7 +2051,7 @@ async function continueAgentLoop(
     for (const event of events) {
       if (event.type === "tool_call") {
         hasToolCall = true;
-        const perceptionTools = ["read_document", "get_selection_info", "get_document_stats"];
+        const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
         for (const tool of event.tools) {
           if (!perceptionTools.includes(tool.tool)) {
             const plan: ActionPlan = {

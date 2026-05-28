@@ -36,6 +36,13 @@ export type DocumentParagraph = {
   isTable: boolean;
   isList: boolean;
   charCount?: number;
+  font?: {
+    name?: string;
+    size?: number;
+    color?: string;
+    bold?: boolean;
+    italic?: boolean;
+  };
 };
 
 export type DocumentStructure = {
@@ -91,6 +98,10 @@ export type AgentSession = {
   messages: ChatMessage[];
   createdAt: number;
   updatedAt: number;
+  /** Cached document structure description for agent-continue context preservation */
+  documentStructureDescription?: string;
+  /** Cached insert mode for agent-continue */
+  insertMode?: string;
 };
 
 // --- Tool Definitions (OpenAI Function Calling format) ---

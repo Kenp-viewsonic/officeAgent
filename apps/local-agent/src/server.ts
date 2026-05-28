@@ -228,6 +228,13 @@ const documentStructureSchema = z.object({
     isTable: z.boolean(),
     isList: z.boolean(),
     charCount: z.number().optional(),
+    font: z.object({
+      name: z.string().optional(),
+      size: z.number().optional(),
+      color: z.string().optional(),
+      bold: z.boolean().optional(),
+      italic: z.boolean().optional(),
+    }).optional(),
   })),
   selection: z.object({
     text: z.string(),
@@ -497,8 +504,13 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: "start", ts: Date.now() })}
 \n`);
 
-    // Create session with initial messages
+    // Create session with initial messages and cache document context for agent-continue
     const sessionId = createSession(enrichedMessages);
+    const createdSession = getSession(sessionId);
+    if (createdSession) {
+      createdSession.documentStructureDescription = documentStructureDescription;
+      createdSession.insertMode = insertMode;
+    }
     res.write(`data: ${JSON.stringify({ type: "session", sessionId })}
 \n`);
 
@@ -651,6 +663,7 @@ const agentContinueSchema = z.object({
     result: z.string(),
     success: z.boolean(),
   })),
+  documentStructure: documentStructureSchema.optional(),
 });
 
 app.post("/v1/chat/agent-continue", async (req, res) => {
@@ -673,12 +686,22 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       return res.status(404).json({ error: "Session not found or expired" });
     }
 
-    const { provider, retrieved, documentStructureDescription, insertMode } = await buildChatContext({
+    // Use fresh document structure from request if provided, otherwise fall back to session-cached context
+    let documentStructureDescription = session.documentStructureDescription;
+    let insertMode = session.insertMode || "smart_action";
+
+    if (parsed.data.documentStructure) {
+      documentStructureDescription = describeDocumentStructure(parsed.data.documentStructure);
+      // Update session cache with fresh data
+      session.documentStructureDescription = documentStructureDescription;
+    }
+
+    const { provider, retrieved } = await buildChatContext({
       messages: session.messages,
       documentContext: undefined,
       documentStructure: undefined,
       selection: undefined,
-      insertMode: "smart_action",
+      insertMode: insertMode as any,
     });
 
     // Ensure the session has an assistant message with tool_calls before tool results

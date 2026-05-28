@@ -27,11 +27,14 @@ declare namespace Word {
     text: string;
     font: Word.Font;
     insertText(text: string, location: Word.InsertLocation): Word.Range;
+    insertHtml(html: string, location: Word.InsertLocation): Word.Range;
     insertParagraph(paragraphText: string, insertLocation: Word.InsertLocation): Word.Paragraph;
     load(option: string | string[]): void;
     search(searchText: string, options?: Word.SearchOptions): Word.SearchRangeCollection;
     paragraphs: Word.ParagraphCollection;
     getFirst(): Word.Range;
+    /** Returns HTML representation of the range; access .value after context.sync() */
+    getHtml(preferredFragmentOnly?: boolean): { value: string };
   }
 
   interface Font {
@@ -48,6 +51,7 @@ declare namespace Word {
     text: string;
     style: string;
     isListItem: boolean;
+    font: Word.Font;
     insertParagraph(paragraphText: string, insertLocation: Word.InsertLocation): Word.Paragraph;
     getRange(rangeLocation: string): Word.Range;
     delete(): void;
