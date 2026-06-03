@@ -56,7 +56,7 @@ export const WORD_TOOLS: ToolDefinition[] = [
           },
           paragraph_index: { type: "number", description: "mode=paragraph_range 时的起始段落序号（从0开始）" },
           count: { type: "number", description: "mode=paragraph_range 时读取的段落数量，默认5" },
-          heading_text: { type: "string", description: "mode=heading_context 时，要查找的标题文本" },
+          heading_text: { type: "string", description: "mode=heading_context 时，要查找的标题文本。如果文档中存在多个同名标题（如目录和正文），工具会自动优先选择实际标题（Heading样式），并在返回结果中列出所有匹配项及其段落序号" },
           surrounding_chars: { type: "number", description: "mode=cursor_surrounding 时，光标前后各读取多少字符，默认500" },
         },
         required: ["mode"],
@@ -386,6 +386,19 @@ export const WORD_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "undo_last_action",
+      description: "撤销最近的文档操作（类似 Ctrl+Z）。用于回退错误的插入、删除或替换。撤销后段落索引会变化，建议撤销后调用 read_document 确认当前文档状态。",
+      parameters: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "撤销步数，默认 1" },
+        },
+      },
+    },
+  },
 ];
 
 // --- Build document structure description ---
@@ -454,6 +467,16 @@ function buildSystemPrompt(
 6. format 参数用于指定插入内容的格式，默认为 normal
 7. 在引用知识库时标注来源编号
 
+## ⚠️ 目标完成准则（最重要）
+**你必须严格区分「打算做」和「已经完成」：**
+- 只有当你通过工具返回的结果**确认**所有操作都成功执行，并且**验证**了结果符合用户预期时，才能调用 task_complete
+- 如果用户的请求包含多个部分（如"先做A，再做B"），你必须**完成所有部分**后才能结束
+- 如果用户的请求是"修改/替换/删除所有X"，你必须**确认所有X都被处理**后才能结束
+- **禁止在未验证的情况下假设操作成功** — 每次操作后都应读取文档确认
+- 如果不确定是否完成，**继续执行**而不是调用 task_complete
+
+**过早结束是严重错误** — 宁可多验证一次，也不要提前结束任务
+
 ## 感知优先原则
 - 如果不确定文档当前状态、目标位置、或索引是否有效，先调用 read_document 或 get_selection_info 确认
 - 插入/删除操作后段落索引会变化，后续操作应基于新的索引
@@ -462,47 +485,203 @@ function buildSystemPrompt(
 - 注意：段落级别字体信息只是该段落的默认/主字体。Word 文档支持在同一段落内对不同文字片段设置不同格式（内联格式），如需精确了解段落内的格式分布（例如某段落中部分文字加粗、部分使用不同字体），请使用 get_paragraph_format 工具获取逐片段的格式详情`;
 
   if (hasTools) {
-    content += `
-
-## 可用工具
-
-### 感知类工具（用于确认文档状态，建议在操作前调用）
-- read_document: 动态读取文档片段（按段落范围、标题上下文、选区、光标周围）
-- get_selection_info: 获取当前选区精确信息（文本、段落索引、是否仅为光标）
-- get_document_stats: 获取文档统计信息（总段落数、字符数、标题列表）
-- get_paragraph_format: 获取指定段落的详细格式信息（段落内每个文本片段的字体、字号、加粗、斜体、颜色），用于检测内联格式变化
-
-### 操作类工具（用于修改文档）
-- insert_after_heading: 在指定标题后插入新内容
-- insert_at_cursor: 在当前光标位置插入内容（推荐，语义最明确）
-- replace_selection: 替换当前选中的文本
-- replace_paragraph: 替换指定段落的全部文本内容（保留格式）
-- insert_at_end: 在文档末尾追加内容
-- insert_at_start: 在文档开头插入内容
-- insert_after_paragraph: 在指定段落序号后插入内容
-- delete_paragraph: 删除指定段落
-- find_and_replace: 查找并替换文本（简单版，仅替换第一处）
-- find_and_replace_v2: 增强版查找替换（支持全文档替换、大小写控制、返回替换次数）
-- set_paragraph_style: 修改指定段落的样式（标题级别、列表格式）
-- apply_rich_format: 对段落或选区应用富文本格式（字体、颜色、加粗、超链接）
-- merge_paragraphs: 合并两个相邻段落
-- reply_only: 仅回复文本，不执行文档操作
-- task_complete: 标记任务已完成，停止 Agent 循环
-
-### 工具使用指南
-- 定位内容：优先使用 find_and_replace_v2 或 read_document(mode="heading_context")，而非依赖可能过时的 paragraph_index
-- 插入内容：光标处插入 → insert_at_cursor；标题后插入 → insert_after_heading；文末 → insert_at_end；文首 → insert_at_start
-- 修改内容：替换整段 → replace_paragraph；修改文字 → find_and_replace_v2；改样式 → set_paragraph_style
-- 格式控制：format 参数只控制段落级别样式（标题、列表等）。插入工具支持 content_format="html"，可直接在 content 中使用 HTML 标签实现内联格式（如 <b>加粗</b>、<i>斜体</i>、<span style="font-family:黑体;font-size:14pt">指定字体</span>）。对已有文本的局部格式化，使用 apply_rich_format 配合 text_to_format 参数精确匹配目标文字
-- 混合格式插入示例：content_format="html", content="这是<b>重点内容</b>和<i>斜体内容</i>的混合段落"
-- 不确定时：先 read_document 确认位置和内容，再执行操作
-
-### 任务完成规则
-- 当你确认所有操作都已执行完毕，或者任务不需要进一步操作时，必须调用 task_complete 工具来结束 Agent 循环
-- task_complete 的 summary 参数应包含任务完成的总结说明
-- 不要无限循环调用感知工具，如果已经获取了足够的信息就执行操作并调用 task_complete
-
-请根据用户意图选择合适的工具调用。如果用户只是提问，使用 reply_only。`;
+    content += "\n\n## 可用工具清单\n\n你有以下工具可以调用。每个工具都有明确的适用场景，请根据用户意图选择最合适的工具。\n";
+    content += "\n---\n\n### 感知类工具 — 先看再动，了解文档现状\n\n";
+    content += "#### 'read_document'\n";
+    content += "读取文档中指定范围的内容。**在不确定段落索引、标题位置、或需要验证操作结果时，必须先调用此工具。**\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| mode | string | 是 | 读取模式，可选值见下方 |\n";
+    content += "| paragraph_index | number | 条件 | mode='paragraph_range' 时，起始段落序号（从 0 开始） |\n";
+    content += "| count | number | 否 | mode='paragraph_range' 时，读取的段落数量，默认 5 |\n";
+    content += "| heading_text | string | 条件 | mode='heading_context' 时，要查找的标题文本 |\n";
+    content += "| surrounding_chars | number | 否 | mode='cursor_surrounding' 时，光标前后各读取多少字符，默认 500 |\n\n";
+    content += "mode 可选值：\n";
+    content += "- 'paragraph_range' — 从 paragraph_index 开始连续读取 count 段\n";
+    content += "- 'heading_context' — 读取 heading_text 对应标题及其下属所有内容（直到遇到同级标题）\n";
+    content += "- 'selection' — 读取当前选中的内容\n";
+    content += "- 'cursor_surrounding' — 读取光标前后的文本\n\n";
+    content += "使用场景：插入前确认目标位置 | 操作后验证结果 | 查看标题下的完整内容 | 获取超出初始上下文的段落\n\n";
+    content += "示例：read_document({ mode: 'heading_context', heading_text: '第三章' }) → 读取'第三章'标题下的所有内容\n\n";
+    content += "---\n\n";
+    content += "#### 'get_selection_info'\n";
+    content += "获取当前选区的精确信息。**无参数**，返回选区文本、起始/结束段落序号、是否仅为光标（无选中文本）。\n\n";
+    content += "使用场景：判断应该用 insert_at_cursor 还是 replace_selection | 确认用户当前操作意图\n\n";
+    content += "---\n\n";
+    content += "#### 'get_document_stats'\n";
+    content += "获取文档统计信息。**无参数**，返回总段落数、总字符数、各级标题列表及其段落序号。\n\n";
+    content += "使用场景：快速了解文档整体结构 | 确定标题是否存在 | 评估文档规模\n\n";
+    content += "---\n\n";
+    content += "#### 'get_paragraph_format'\n";
+    content += "获取指定段落的**内联格式详情**。返回段落默认字体 + 每个文字片段（run）的独立格式信息。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| paragraph_index | number | 是 | 要查看的段落序号（从 0 开始） |\n\n";
+    content += "返回值解读：\n- runs 只有 1 个 → 全段格式统一\n- runs 有多个 → 段落内存在格式变化（部分加粗、不同字体等）\n\n";
+    content += "使用场景：需要精确了解段落内格式分布 | 判断是否需要修改内联格式\n\n";
+    content += "---\n\n";
+    content += "### 操作类工具 — 安全可自动迭代\n\n";
+    content += "> 以下工具可在 Agent 循环中自动执行（无需用户确认），建议操作后用 read_document 验证结果。\n\n";
+    content += "#### 'insert_at_cursor' [最常用]\n";
+    content += "在**光标位置**插入内容。如果有选区，选区内容会被替换。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| content | string | 是 | 要插入的文本内容 |\n";
+    content += "| content_format | enum | 否 | 'text'（默认）或 'html'（支持内联格式标签） |\n";
+    content += "| format | enum | 否 | 段落样式：'normal'（默认）、'heading1'-'heading3'、'bullet_list'、'numbered_list' |\n\n";
+    content += "示例：insert_at_cursor({ content: '这是新增的段落', format: 'heading2' })\n\n";
+    content += "---\n\n";
+    content += "#### 'insert_after_heading'\n";
+    content += "在指定**标题后面**插入内容。通过标题文本定位，匹配失败则插入到文档末尾。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| heading_text | string | 是 | 要定位的标题文本（精确匹配） |\n";
+    content += "| content | string | 是 | 要插入的内容 |\n";
+    content += "| content_format | enum | 否 | 'text'（默认）或 'html' |\n";
+    content += "| format | enum | 否 | 段落样式，默认 normal |\n\n";
+    content += "示例：insert_after_heading({ heading_text: '第三章', content: '这是新增的内容' })\n\n";
+    content += "---\n\n";
+    content += "#### 'insert_after_paragraph'\n";
+    content += "在指定**段落序号后**插入内容。段落序号从文档结构中获取。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| paragraph_index | number | 是 | 目标段落的序号（从文档结构中获取，从 0 开始） |\n";
+    content += "| content | string | 是 | 要插入的内容 |\n";
+    content += "| content_format | enum | 否 | 'text'（默认）或 'html' |\n";
+    content += "| format | enum | 否 | 段落样式，默认 normal |\n\n";
+    content += "**注意**：插入/删除后段落索引会变化，必须先 read_document 确认索引。\n\n";
+    content += "---\n\n";
+    content += "#### 'delete_paragraph'\n";
+    content += "删除指定段落序号的内容。**不可撤销**（但可用 undo_last_action 回退）。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| paragraph_index | number | 是 | 要删除的段落序号（从 0 开始） |\n\n";
+    content += "**注意**：删除后段落索引会变化，必须先 read_document 确认索引。\n\n";
+    content += "---\n\n";
+    content += "#### 'replace_selection'\n";
+    content += "替换当前**选中文本**。空选区时等同于 insert_at_cursor。建议先用 get_selection_info 确认状态。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| content | string | 是 | 替换后的新内容 |\n";
+    content += "| content_format | enum | 否 | 'text'（默认）或 'html' |\n";
+    content += "| format | enum | 否 | 段落样式，默认 normal |\n\n";
+    content += "---\n\n";
+    content += "#### 'replace_paragraph'\n";
+    content += "替换指定段落的**全部文本**，保留原有格式。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| paragraph_index | number | 是 | 目标段落序号（从 0 开始） |\n";
+    content += "| content | string | 是 | 替换后的新内容 |\n";
+    content += "| content_format | enum | 否 | 'text'（默认）或 'html' |\n\n";
+    content += "---\n\n";
+    content += "#### 'insert_at_end'\n";
+    content += "在文档**末尾追加**内容。参数同 insert_at_cursor。\n\n";
+    content += "---\n\n";
+    content += "#### 'find_and_replace_v2' [推荐用于查找替换]\n";
+    content += "增强版全文查找替换，**返回替换了多少处**。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| find_text | string | 是 | 要查找的文本 |\n";
+    content += "| replace_text | string | 是 | 替换为的文本 |\n";
+    content += "| replace_all | boolean | 否 | 是否替换全部匹配项，默认 false（仅第一处） |\n";
+    content += "| match_case | boolean | 否 | 是否区分大小写，默认 false |\n";
+    content += "| match_whole_word | boolean | 否 | 是否全词匹配，默认 false |\n\n";
+    content += "**注意**：如果返回 replaced=0，说明没找到，不要再基于假设继续操作。\n\n";
+    content += "示例：find_and_replace_v2({ find_text: '旧名称', replace_text: '新名称', replace_all: true }) → 将所有'旧名称'替换为'新名称'\n\n";
+    content += "---\n\n";
+    content += "#### 'set_paragraph_style'\n";
+    content += "修改指定段落的**样式**（标题级别、列表格式），不改变内容。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| paragraph_index | number | 是 | 目标段落序号 |\n";
+    content += "| format | enum | 是 | 'normal'、'heading1'-'heading3'、'bullet_list'、'numbered_list' |\n\n";
+    content += "---\n\n";
+    content += "#### 'apply_rich_format'\n";
+    content += "对段落或选区应用**富文本格式**（字体、颜色、加粗、斜体、超链接）。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| target_mode | enum | 是 | 'selection'=当前选区；'paragraph_index'=指定段落；'last_inserted'=上次插入的段落 |\n";
+    content += "| paragraph_index | number | 条件 | target_mode='paragraph_index' 时必填 |\n";
+    content += "| text_to_format | string | 否 | 段落内要格式化的精确文本片段（留空=格式化整段） |\n";
+    content += "| font.name | string | 否 | 字体名称，如 '微软雅黑' |\n";
+    content += "| font.size | number | 否 | 字号（磅），如 14 |\n";
+    content += "| font.color | string | 否 | 颜色，如 '#FF0000' |\n";
+    content += "| font.bold | boolean | 否 | 是否加粗 |\n";
+    content += "| font.italic | boolean | 否 | 是否斜体 |\n";
+    content += "| hyperlink.text | string | 否 | 超链接显示文本 |\n";
+    content += "| hyperlink.url | string | 否 | 超链接 URL |\n\n";
+    content += "示例：apply_rich_format({ target_mode: 'paragraph_index', paragraph_index: 3, text_to_format: '重点', font: { bold: true, color: '#FF0000' } }) → 把第3段中'重点'二字设为红色加粗\n\n";
+    content += "---\n\n";
+    content += "#### 'merge_paragraphs'\n";
+    content += "合并两个**相邻段落**。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| first_paragraph_index | number | 是 | 保留段落的序号 |\n";
+    content += "| second_paragraph_index | number | 是 | 被合并段落的序号（合并后删除） |\n";
+    content += "| separator | string | 否 | 两段之间的分隔符，默认空格 |\n\n";
+    content += "---\n\n";
+    content += "#### 'undo_last_action'\n";
+    content += "撤销最近的文档操作（类似 Ctrl+Z）。用于回退错误的插入、删除或替换。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| count | number | 否 | 撤销步数，默认 1 |\n\n";
+    content += "**注意**：撤销后段落索引会变化，必须调用 read_document 确认当前状态。\n\n";
+    content += "---\n\n";
+    content += "### 高风险操作 — 需要用户确认后才执行\n\n";
+    content += "> 以下工具不会在 Agent 循环中自动执行，会先展示给用户确认。\n\n";
+    content += "#### 'insert_at_start'\n在文档**开头**插入内容。空文档时有风险。\n\n";
+    content += "#### 'find_and_replace'\n简单版查找替换（只能替换第一处，大小写敏感）。推荐使用 find_and_replace_v2 代替。\n\n";
+    content += "---\n\n";
+    content += "### 控制类工具\n\n";
+    content += "#### 'reply_only'\n仅回复文本，**不操作文档**。用于纯问答、解释、建议等不需要编辑的场景。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| content | string | 是 | 回复给用户的文本 |\n\n";
+    content += "---\n\n";
+    content += "#### 'task_complete' [必须调用]\n";
+    content += "**标记任务完成**，结束 Agent 循环。\n\n";
+    content += "**⚠️ 调用条件（必须同时满足）：**\n";
+    content += "1. 用户请求的**所有操作**都已执行完成\n";
+    content += "2. 通过 read_document 或其他感知工具**验证**了操作结果\n";
+    content += "3. 结果**符合用户预期**（如替换了所有目标、插入了完整内容等）\n\n";
+    content += "**禁止调用的情况：**\n";
+    content += "- 只完成了用户请求的一部分（如用户要求处理5个章节，只处理了3个）\n";
+    content += "- 操作后未验证结果\n";
+    content += "- 不确定是否所有目标都已达成\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| summary | string | 是 | 任务完成的总结说明（会展示给用户） |\n\n";
+    content += "---\n\n";
+    content += "## 通用规范\n\n";
+    content += "### HTML 内联格式（content_format='html'）\n";
+    content += "所有插入/替换工具都支持 content_format='html'，可直接在 content 中使用 HTML 标签：\n";
+    content += "- <b>加粗</b>、<i>斜体</i>、<u>下划线</u>\n";
+    content += "- <span style='font-family:黑体;font-size:14pt'>指定字体</span>\n";
+    content += "- 混合示例：content_format='html', content='这是<b>重点</b>和<i>斜体</i>的混合段落'\n\n";
+    content += "### format 参数枚举\n";
+    content += "'normal'（默认）| 'heading1' | 'heading2' | 'heading3' | 'bullet_list' | 'numbered_list'\n\n";
+    content += "### content 参数注意事项\n";
+    content += "- 必须是**非空字符串**，空字符串会导致错误\n";
+    content += "- 不要使用 Markdown 标记（如 **、#、代码块 等），应使用 HTML 标签或直接纯文本\n\n";
+    content += "---\n\n";
+    content += "## 自我迭代工作流\n\n";
+    content += "你可以在一个 Agent 循环中完成 感知 → 操作 → 验证 → 结束 的完整流程：\n\n";
+    content += "| 步骤 | 做什么 | 用什么工具 |\n|------|--------|-----------|\n";
+    content += "| 1. 感知 | 了解文档现状 | read_document、get_document_stats、get_selection_info |\n";
+    content += "| 2. 操作 | 执行修改 | insert_at_cursor、find_and_replace_v2、replace_paragraph 等 |\n";
+    content += "| 3. 验证 | 确认修改结果 | read_document、get_selection_info |\n";
+    content += "| 4. 修正 | 不满足预期则继续调整 | 回到步骤 2 |\n";
+    content += "| 5. 结束 | **验证通过后**标记任务完成 | task_complete |\n\n";
+    content += "**示例**：用户说「把所有'旧名称'换成'新名称'」\n";
+    content += "1. find_and_replace_v2({ find_text: '旧名称', replace_text: '新名称', replace_all: true }) → 收到 replaced=3\n";
+    content += "2. read_document({ mode: 'paragraph_range', paragraph_index: 0, count: 10 }) → 确认替换后的内容\n";
+    content += "3. task_complete({ summary: '已将文档中所有 3 处旧名称替换为新名称' }) → 结束\n\n";
+    content += "**示例**：用户说「在第3章后插入答案」\n";
+    content += "1. read_document({ mode: 'heading_context', heading_text: '第三章' }) → 确认目标位置和段落索引\n";
+    content += "2. insert_after_paragraph({ paragraph_index: 42, content: '答案内容...' }) → 插入\n";
+    content += "3. read_document({ mode: 'paragraph_range', paragraph_index: 40, count: 10 }) → **必须读取**，验证插入结果+获取新索引\n";
+    content += "4. task_complete({ summary: '已在第3章后插入答案' }) → 结束\n\n";
+    content += "**重要提示**：\n";
+    content += "- 不要把'打算做'和'已经做'混淆——只有工具返回的结果才能确认操作已成功\n";
+    content += "- 不确定时优先 read_document，不要猜\n";
+    content += "- 如果 find_and_replace_v2 返回 replaced=0，说明查找失败，检查 find_text 是否正确\n";
+    content += "- **严禁重复操作**：如果工具返回结果显示操作已成功（如「已在段落 X 后插入内容」），说明该操作已完成，绝对不要对同一目标再次执行相同操作。直接进行下一步或调用 task_complete\n";
+    content += "- **多题场景**：用户要求回答多道题目时，每道题插入完成后不要回头重做已完成的题目，依次处理即可\n";
+    content += "- **段落索引失效规则（最重要）**：insert_after_paragraph 和 delete_paragraph 会改变文档中后续段落的索引号。因此：\n";
+    content += "  - 每次 insert_after_paragraph 或 delete_paragraph 执行成功后，**必须先调用 read_document 获取最新段落索引**，然后才能进行下一次插入/删除/替换操作\n";
+    content += "  - **绝对禁止**连续调用 insert_after_paragraph 或 delete_paragraph 而中间不插入 read_document\n";
+    content += "  - 正确流程：read_document → 操作 → read_document（验证+获取新索引）→ 下一个操作\n";
+    content += "  - 同样，undo_last_action 也会改变段落索引，撤销后必须 read_document\n";
+    content += "- **目标检查清单**：在调用 task_complete 前，回顾用户原始请求，确认：\n";
+    content += "  □ 是否完成了用户要求的所有操作？\n";
+    content += "  □ 是否验证了操作结果？\n";
+    content += "  □ 是否有遗漏的目标未处理？\n";
+    content += "  如果任何一项为「否」，继续执行而不是调用 task_complete\n";
   }
 
   if (insertMode === "chat_only") {
@@ -556,9 +735,16 @@ function buildPayload(
       : "当前没有检索到知识库片段，你可以基于用户输入给出通用建议。",
   };
 
+  // Sanitize messages: remove orphaned tool_calls that have no matching tool
+  // response messages.  This prevents 400 errors from the LLM API when a
+  // session contains assistant messages with tool_calls that were never
+  // followed up (e.g. user abandoned an action_plan, or an error occurred
+  // before tool results could be sent).
+  const sanitized = sanitizeMessages(messages);
+
   const payload: Record<string, any> = {
     model: config.model,
-    messages: [systemPrompt, retrievalPrompt, ...messages],
+    messages: [systemPrompt, retrievalPrompt, ...sanitized],
     temperature: config.temperature ?? 0.2,
     max_tokens: config.maxTokens ?? 900,
     stream,
@@ -570,6 +756,83 @@ function buildPayload(
   }
 
   return payload;
+}
+
+/**
+ * Walk through the message array and fix three kinds of inconsistencies:
+ *
+ * 1. Assistant messages with `tool_calls` where some tool_call IDs have no
+ *    matching `tool` role response → strip `tool_calls`, keep text content.
+ * 2. `tool` role messages whose `tool_call_id` does not belong to any
+ *    preceding assistant `tool_calls` → drop the orphaned tool message.
+ * 3. Duplicate `tool` messages with the same `tool_call_id` → keep only the
+ *    first occurrence (APIs require exactly one tool response per tool_call).
+ *
+ * This prevents 400 errors from OpenAI-compatible APIs that enforce both:
+ *   - "every tool_call must be followed by a tool response"
+ *   - "every tool message must be a response to a preceding tool_call"
+ */
+function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
+  // Pass 1: identify which assistant tool_call IDs have matching tool responses
+  // and which tool messages are orphaned.
+  const validToolCallIds = new Set<string>();
+  const assistantIdxWithToolCalls: Array<{ index: number; ids: Set<string> }> = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
+      const ids = new Set(msg.tool_calls.map((tc) => tc.id));
+      assistantIdxWithToolCalls.push({ index: i, ids });
+    }
+  }
+
+  // For each assistant with tool_calls, check if all IDs have responses
+  for (const entry of assistantIdxWithToolCalls) {
+    const remaining = new Set(entry.ids);
+    let j = entry.index + 1;
+    while (j < messages.length && messages[j].role === "tool") {
+      const tcId = messages[j].tool_call_id;
+      if (tcId) {
+        remaining.delete(tcId);
+      }
+      j++;
+    }
+    if (remaining.size === 0) {
+      // All tool_calls have responses — mark them as valid
+      for (const id of entry.ids) {
+        validToolCallIds.add(id);
+      }
+    }
+  }
+
+  // Pass 2: build sanitized result, deduplicating tool messages by tool_call_id
+  const result: ChatMessage[] = [];
+  const seenToolCallIds = new Set<string>();
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
+      const ids = assistantIdxWithToolCalls.find((e) => e.index === i)?.ids;
+      if (ids && [...ids].every((id) => validToolCallIds.has(id))) {
+        // All tool_calls are valid — keep as-is
+        result.push(msg);
+      } else {
+        // Orphaned tool_calls — strip them, keep text only
+        result.push({ role: "assistant", content: msg.content || "" });
+      }
+    } else if (msg.role === "tool" && msg.tool_call_id) {
+      if (validToolCallIds.has(msg.tool_call_id) && !seenToolCallIds.has(msg.tool_call_id)) {
+        // Valid and first occurrence — keep it
+        seenToolCallIds.add(msg.tool_call_id);
+        result.push(msg);
+      }
+      // else: orphaned or duplicate tool message — drop it
+    } else {
+      result.push(msg);
+    }
+  }
+
+  return result;
 }
 
 // --- Parse action plan from LLM response ---
@@ -653,6 +916,8 @@ function describeAction(actionName: string, params: Record<string, any>): string
       return "仅回复文本";
     case "task_complete":
       return `任务完成：${params.summary || ""}`;
+    case "undo_last_action":
+      return `撤销最近 ${params.count || 1} 步操作`;
     default:
       return `${actionName}: ${JSON.stringify(params)}`;
   }
@@ -799,6 +1064,19 @@ export async function callOpenAICompatible(
 export function isPerceptionOnlyPlan(plan: ActionPlan): boolean {
   const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
   return plan.actions.length > 0 && plan.actions.every((a) => perceptionTools.includes(a.action));
+}
+
+export function isIterablePlan(plan: ActionPlan): boolean {
+  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
+  const iterableActionTools = [
+    "find_and_replace", "find_and_replace_v2", 
+    "insert_at_cursor", "insert_after_heading", "insert_at_end", "insert_after_paragraph",
+    "delete_paragraph",
+    "replace_paragraph", "set_paragraph_style", "merge_paragraphs", "apply_rich_format",
+    "undo_last_action",
+  ];
+  const iterableTools = [...perceptionTools, ...iterableActionTools];
+  return plan.actions.length > 0 && plan.actions.every((a) => iterableTools.includes(a.action));
 }
 
 export async function streamOpenAICompatible(
@@ -1011,7 +1289,7 @@ export async function streamOpenAICompatible(
           clearTimeout(firstTokenTimer);
         }
         fullText += content;
-        onDelta(fullText);
+        onDelta(content);
       }
     }
   }

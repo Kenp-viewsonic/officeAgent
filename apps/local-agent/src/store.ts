@@ -1,14 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { ProviderConfig, RetrievalChunk } from "./types.js";
+import { ProviderConfig, ConfigPreset, RetrievalChunk } from "./types.js";
 
 const dataRoot = path.resolve(process.cwd(), "data");
 const configFile = path.join(dataRoot, "provider-config.json");
+const presetsFile = path.join(dataRoot, "config-presets.json");
 const kbFile = path.join(dataRoot, "kb-chunks.json");
 
 async function ensureDataRoot() {
   await fs.mkdir(dataRoot, { recursive: true });
 }
+
+// ─── Single Config (legacy) ─────────────────────────────────────────────────
 
 export async function saveProviderConfig(config: ProviderConfig): Promise<void> {
   await ensureDataRoot();
@@ -22,6 +25,38 @@ export async function loadProviderConfig(): Promise<ProviderConfig | null> {
   } catch {
     return null;
   }
+}
+
+// ─── Config Presets ─────────────────────────────────────────────────────────
+
+export async function loadPresets(): Promise<ConfigPreset[]> {
+  try {
+    const raw = await fs.readFile(presetsFile, "utf-8");
+    return JSON.parse(raw) as ConfigPreset[];
+  } catch {
+    return [];
+  }
+}
+
+export async function savePreset(preset: ConfigPreset): Promise<ConfigPreset[]> {
+  const presets = await loadPresets();
+  const idx = presets.findIndex((p) => p.id === preset.id);
+  if (idx >= 0) {
+    presets[idx] = { ...preset, updatedAt: Date.now() };
+  } else {
+    presets.push({ ...preset, createdAt: Date.now(), updatedAt: Date.now() });
+  }
+  await ensureDataRoot();
+  await fs.writeFile(presetsFile, JSON.stringify(presets, null, 2), "utf-8");
+  return presets;
+}
+
+export async function deletePreset(id: string): Promise<ConfigPreset[]> {
+  const presets = await loadPresets();
+  const filtered = presets.filter((p) => p.id !== id);
+  await ensureDataRoot();
+  await fs.writeFile(presetsFile, JSON.stringify(filtered, null, 2), "utf-8");
+  return filtered;
 }
 
 export async function appendChunks(chunks: RetrievalChunk[]): Promise<void> {

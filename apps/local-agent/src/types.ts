@@ -8,6 +8,14 @@ export type ProviderConfig = {
   overallTimeout?: number;
 };
 
+export type ConfigPreset = {
+  id: string;
+  name: string;
+  config: ProviderConfig;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content: string;

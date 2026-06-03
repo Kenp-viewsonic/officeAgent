@@ -9,6 +9,8 @@
   "scripts": {
     "dev:agent": "npm run dev -w @office-agent/local-agent",
     "dev:addin": "npm run dev -w @office-agent/word-addin",
-    "build": "npm run build --workspaces"
+    "build": "npm run build --workspaces",
+    "build:prod": "npm run build:prod -w @office-agent/word-addin && npm run build -w @office-agent/local-agent",
+    "package": "powershell -ExecutionPolicy Bypass -File scripts/package.ps1"
   }
 }

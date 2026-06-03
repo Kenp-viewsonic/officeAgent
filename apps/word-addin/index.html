@@ -17,14 +17,30 @@
         <p>本地运行，直连你的模型订阅</p>
       </header>
 
-      <details class="card menu-card" id="menuCard">
-        <summary>
-          <span>配置与知识库</span>
-          <span class="summary-hint">展开管理</span>
-        </summary>
+      <!-- Sidebar overlay -->
+      <div id="sidebarOverlay" class="sidebar-overlay"></div>
 
+      <!-- Right sidebar -->
+      <aside class="sidebar" id="menuSidebar">
+        <div class="sidebar-header">
+          <span>配置与知识库</span>
+          <button id="sidebarClose" class="sidebar-close" type="button" aria-label="关闭">✕</button>
+        </div>
+        <div class="sidebar-body">
         <section class="subcard">
           <h2>模型配置</h2>
+          <label>配置方案
+            <div class="row actions">
+              <select id="presetSelect">
+                <option value="">-- 未保存的配置 --</option>
+              </select>
+              <button id="loadPreset" class="secondary" type="button">加载</button>
+            </div>
+          </label>
+          <div class="row actions">
+            <button id="savePreset" class="secondary" type="button">保存为方案</button>
+            <button id="deletePreset" class="secondary danger" type="button">删除方案</button>
+          </div>
           <label>Base URL <input id="baseUrl" placeholder="https://api.openai.com/v1" /></label>
           <label>API Key <input id="apiKey" type="password" placeholder="sk-..." /></label>
           <label>Model
@@ -44,6 +60,14 @@
           </div>
           <button id="saveConfig">保存配置</button>
           <p id="configStatus" class="status"></p>
+        </section>
+
+        <section class="subcard">
+          <h2>Agent 行为</h2>
+          <label>最大迭代次数（防止无限循环）
+            <input id="maxIterations" type="number" min="1" max="20" step="1" value="10" />
+          </label>
+          <p class="status" style="color:var(--muted);">数值越大，Agent 能执行越复杂的多步任务。建议 8-15。</p>
         </section>
 
         <section class="subcard">
@@ -72,9 +96,10 @@
           </div>
           <p id="kbImportStatus" class="status"></p>
         </section>
-      </details>
+        </div>
+      </aside>
 
-      <section class="card">
+      <section class="card chat-card">
         <h2>对话</h2>
         <div class="row actions">
           <select id="sessionSelect"></select>
@@ -85,8 +110,18 @@
           <button id="deleteSession" class="secondary danger" type="button">删除当前会话</button>
         </div>
         <div id="chatLog" class="chatlog"></div>
-        <textarea id="userInput" rows="4" placeholder="例如：在第三章后加一段总结"></textarea>
+        <div id="dropZone" class="drop-zone">
+          <textarea id="userInput" rows="4" placeholder="例如：在第三章后加一段总结（支持拖拽纯文本文件）"></textarea>
+          <div id="dropOverlay" class="drop-overlay" style="display:none;">📂 释放以附加文件</div>
+        </div>
+        <div id="attachmentPreview" class="attachment-preview" style="display:none;">
+          <span id="attachmentName" class="attachment-name"></span>
+          <span id="attachmentSize" class="attachment-size"></span>
+          <button id="removeAttachment" class="secondary danger" type="button">✕</button>
+        </div>
         <div class="row actions">
+          <input id="fileInput" type="file" accept=".txt,.md,.json,.csv,.xml,.yaml,.yml,.log,.ini,.cfg,.conf,.toml,.py,.js,.ts,.java,.c,.cpp,.h,.hpp,.go,.rs,.rb,.php,.sh,.bat,.ps1,.sql,.html,.css,.svg" hidden />
+          <button id="attachBtn" class="secondary" type="button" title="附加纯文本文件">📎 附件</button>
           <button id="sendMsg">发送</button>
           <select id="insertMode">
             <option value="smart_action">智能操作（LLM 决定）</option>

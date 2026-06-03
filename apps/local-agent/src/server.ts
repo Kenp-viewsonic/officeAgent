@@ -5,10 +5,10 @@ import path from "node:path";
 import mammoth from "mammoth";
 import { z } from "zod";
 import { createSession, getSession, appendToSession, deleteSession } from "./agent-session.js";
-import { callOpenAICompatible, describeDocumentStructure, isPerceptionOnlyPlan, listOpenAICompatibleModels, LlmHttpError, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
+import { callOpenAICompatible, describeDocumentStructure, isPerceptionOnlyPlan, isIterablePlan, listOpenAICompatibleModels, LlmHttpError, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
 import { keywordRetrieve, splitToChunks } from "./retrieval.js";
-import { appendChunks, clearAllChunks, deleteChunksByFile, getKbFileList, getKbStats, importChunks, loadChunks, loadProviderConfig, saveProviderConfig } from "./store.js";
-import { ActionPlan, ChatMessage, DocumentStructure, ProviderConfig, RetrievalChunk } from "./types.js";
+import { appendChunks, clearAllChunks, deleteChunksByFile, getKbFileList, getKbStats, importChunks, loadChunks, loadProviderConfig, saveProviderConfig, loadPresets, savePreset, deletePreset } from "./store.js";
+import { ActionPlan, ChatMessage, DocumentStructure, ProviderConfig, ConfigPreset, RetrievalChunk } from "./types.js";
 
 const app = express();
 const upload = multer({ limits: { fileSize: Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024 } });
@@ -18,6 +18,10 @@ const port = Number(process.env.PORT ?? 8787);
 
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "2mb" }));
+
+// Serve the Word Add-in frontend (built into public/ by package.ps1)
+const publicDir = path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), "public");
+app.use(express.static(publicDir));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "office-agent-local", host, port });
@@ -110,6 +114,64 @@ app.get("/v1/provider/config", async (_req, res) => {
   });
 });
 
+// ─── Config Presets ─────────────────────────────────────────────────────────
+
+const presetSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  config: z.object({
+    baseUrl: z.string().url(),
+    apiKey: z.string().min(1),
+    model: z.string().min(1),
+    temperature: z.number().min(0).max(2).optional(),
+    maxTokens: z.number().int().positive().optional(),
+    firstTokenTimeout: z.number().int().min(5).max(120).optional(),
+    overallTimeout: z.number().int().min(30).max(600).optional(),
+  }),
+});
+
+app.get("/v1/presets", async (_req, res) => {
+  const presets = await loadPresets();
+  // Mask API keys in response
+  const safe = presets.map((p) => ({
+    ...p,
+    config: { ...p.config, apiKey: "***" },
+  }));
+  return res.json({ ok: true, presets: safe });
+});
+
+app.post("/v1/presets", async (req, res) => {
+  const result = presetSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({ error: "Invalid preset", details: result.error.flatten() });
+  }
+  const presets = await savePreset(result.data as ConfigPreset);
+  const safe = presets.map((p) => ({
+    ...p,
+    config: { ...p.config, apiKey: "***" },
+  }));
+  return res.json({ ok: true, presets: safe });
+});
+
+app.delete("/v1/presets/:id", async (req, res) => {
+  const presets = await deletePreset(req.params.id);
+  const safe = presets.map((p) => ({
+    ...p,
+    config: { ...p.config, apiKey: "***" },
+  }));
+  return res.json({ ok: true, presets: safe });
+});
+
+app.post("/v1/presets/:id/activate", async (req, res) => {
+  const presets = await loadPresets();
+  const preset = presets.find((p) => p.id === req.params.id);
+  if (!preset) {
+    return res.status(404).json({ error: "Preset not found" });
+  }
+  await saveProviderConfig(preset.config);
+  return res.json({ ok: true });
+});
+
 app.get("/v1/provider/models", async (_req, res) => {
   const config = await loadProviderConfig();
   if (!config) {
@@ -200,7 +262,7 @@ const importSchema = z.object({
 app.post("/v1/kb/import", async (req, res) => {
   const result = importSchema.safeParse(req.body);
   if (!result.success) {
-    return res.status(400).json({ error: "Invalid import payload", details: result.error.flatten() });
+    return res.status(400).json({ error: `Invalid import payload: ${formatZodError(result.error)}`, details: result.error.flatten() });
   }
 
   const { chunks, mode = "merge" } = result.data;
@@ -288,10 +350,14 @@ async function buildChatContext(payload: z.infer<typeof chatSchema>) {
 
 // --- Non-streaming chat endpoint ---
 
+function formatZodError(err: z.ZodError): string {
+  return err.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+}
+
 app.post("/v1/chat", async (req, res) => {
   const parsed = chatSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: "Invalid chat payload", details: parsed.error.flatten() });
+    return res.status(400).json({ error: `Invalid chat payload: ${formatZodError(parsed.error)}`, details: parsed.error.flatten() });
   }
 
   try {
@@ -331,7 +397,7 @@ app.post("/v1/chat", async (req, res) => {
 app.post("/v1/chat/stream", async (req, res) => {
   const parsed = chatSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: "Invalid chat payload", details: parsed.error.flatten() });
+    return res.status(400).json({ error: `Invalid chat payload: ${formatZodError(parsed.error)}`, details: parsed.error.flatten() });
   }
 
   const abortController = new AbortController();
@@ -469,6 +535,12 @@ async function runAgentIteration(
       return { reply: result.reply, actionPlan, done: false, toolCalls: result.toolCalls };
     }
 
+    // Check if tool calls are iterable (perception + safe action tools) - continue loop
+    if (isIterablePlan(actionPlan)) {
+      onEvent({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) });
+      return { reply: result.reply, actionPlan, done: false, toolCalls: result.toolCalls };
+    }
+
     // Mixed or action-only: send action_plan event and finish
     onEvent({ type: "action_plan", plan: actionPlan });
     return { reply: result.reply, actionPlan, done: true, toolCalls: result.toolCalls };
@@ -481,7 +553,7 @@ async function runAgentIteration(
 app.post("/v1/chat/agent-stream", async (req, res) => {
   const parsed = agentStreamSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: "Invalid chat payload", details: parsed.error.flatten() });
+    return res.status(400).json({ error: `Invalid chat payload: ${formatZodError(parsed.error)}`, details: parsed.error.flatten() });
   }
 
   const abortController = new AbortController();
@@ -494,7 +566,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
 
   try {
     const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode } = await buildChatContext(parsed.data);
-    const maxIterations = parsed.data.maxIterations ?? 5;
+    const maxIterations = parsed.data.maxIterations ?? 10;
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -558,8 +630,10 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
           if (isPerceptionOnlyPlan(actionPlan)) {
             res.write(`data: ${JSON.stringify({ type: "tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}
 \n`);
-            iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };
-          } else {
+            iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };          } else if (isIterablePlan(actionPlan)) {
+            res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}
+\n`);
+            iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };          } else {
             res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}
 \n`);
             iterationResult = { reply: fallbackResult.reply, actionPlan, done: true, toolCalls: fallbackResult.toolCalls };
@@ -574,7 +648,11 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
       finalReply = iterationResult.reply;
       finalActionPlan = iterationResult.actionPlan;
 
-      // Always save assistant reply to session history
+      // Save assistant reply to session history — always include tool_calls so
+      // that when the client later sends tool results via agent-continue, the
+      // preceding assistant message is present.  Orphaned tool_calls (where the
+      // user abandons the session) are cleaned up by sanitizeMessages() before
+      // each LLM call.
       if (iterationResult.toolCalls && iterationResult.toolCalls.length > 0) {
         currentMessages.push({
           role: "assistant",
@@ -582,7 +660,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
           tool_calls: iterationResult.toolCalls,
         });
       } else if (iterationResult.actionPlan && iterationResult.actionPlan.actions.length > 0) {
-        // Action plan from text parsing - create synthetic tool_calls for session
+        // Action plan from text parsing — create synthetic tool_calls for session
         const syntheticToolCalls = iterationResult.actionPlan.actions.map((action, index) => ({
           id: action.toolCallId || `text-parsed-${Date.now()}-${index}`,
           type: "function" as const,
@@ -669,7 +747,7 @@ const agentContinueSchema = z.object({
 app.post("/v1/chat/agent-continue", async (req, res) => {
   const parsed = agentContinueSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: "Invalid continue payload", details: parsed.error.flatten() });
+    return res.status(400).json({ error: `Invalid continue payload: ${formatZodError(parsed.error)}`, details: parsed.error.flatten() });
   }
 
   const abortController = new AbortController();
@@ -707,13 +785,15 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     // Ensure the session has an assistant message with tool_calls before tool results
     // If the last message is assistant but has no tool_calls, or is not assistant,
     // we need to handle this gracefully
-    const lastMsg = session.messages[session.messages.length - 1];
-    if (lastMsg.role !== "assistant") {
-      // The session doesn't have a proper assistant message.
-      // This can happen when the action plan came from text parsing (no tool_calls).
-      // In this case, we cannot continue the agent loop properly.
-      // Return a meaningful error so the frontend can handle it.
-      return res.status(400).json({ error: "无法继续 Agent 循环：当前会话状态不包含待处理的工具调用。操作已在本地执行完成。" });
+    // Note: there may be trailing system messages (goal reminders) after the assistant msg,
+    // so walk backwards to find the actual last assistant message.
+    const lastAssistantIdx = [...session.messages].reverse().findIndex((m) => m.role === "assistant");
+    if (lastAssistantIdx === -1) {
+      return res.status(400).json({ error: "无法继续 Agent 循环：会话中没有 assistant 消息，无法附加工具结果。" });
+    }
+    const lastAssistant = session.messages[session.messages.length - 1 - lastAssistantIdx];
+    if (!lastAssistant.tool_calls || lastAssistant.tool_calls.length === 0) {
+      return res.status(400).json({ error: "无法继续 Agent 循环：最后一条 assistant 消息不包含 tool_calls，可能操作已在本地解析完成。" });
     }
 
     // Append tool results to session messages
@@ -723,6 +803,15 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
         content: tr.result,
         tool_call_id: tr.toolCallId,
         name: tr.toolName,
+      });
+    }
+
+    // Inject goal reminder after tool results to prevent premature task completion
+    const originalUserMsg = session.messages.find((m) => m.role === "user");
+    if (originalUserMsg) {
+      session.messages.push({
+        role: "system",
+        content: `【目标提醒】用户的原始请求是：「${originalUserMsg.content.slice(0, 200)}」。请回顾此目标，确认是否所有操作都已完成并通过验证。如果还有未完成的部分，继续执行；只有确认所有目标都达成后才调用 task_complete。`,
       });
     }
 
@@ -767,7 +856,10 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
 \n`);
     }
 
-    // Save the new assistant message to session for next iteration
+    // Save the new assistant message to session for next iteration.
+    // Always persist tool_calls so that when the client later sends tool
+    // results via agent-continue, the preceding assistant message is present.
+    // Orphaned tool_calls are cleaned up by sanitizeMessages() before each LLM call.
     if (result.toolCalls && result.toolCalls.length > 0) {
       session.messages.push({
         role: "assistant",
@@ -775,7 +867,7 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
         tool_calls: result.toolCalls,
       });
     } else if (result.actionPlan && result.actionPlan.actions.length > 0) {
-      // Action plan from text parsing - create synthetic tool_calls for session
+      // Action plan from text parsing — create synthetic tool_calls for session
       const syntheticToolCalls = result.actionPlan.actions.map((action, index) => ({
         id: action.toolCallId || `text-parsed-${Date.now()}-${index}`,
         type: "function" as const,
@@ -806,16 +898,15 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
           const args = JSON.parse(taskCompleteCall.function.arguments || "{}");
           summary = args.summary || summary;
         } catch { /* ignore */ }
-        res.write(`data: ${JSON.stringify({ type: "task_complete", summary })}
-\n`);
+        res.write(`data: ${JSON.stringify({ type: "task_complete", summary })}\n\n`);
       } else {
         const actionPlan = parseActionPlanFromToolCalls(result.toolCalls);
         if (isPerceptionOnlyPlan(actionPlan)) {
-          res.write(`data: ${JSON.stringify({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}
-\n`);
+          res.write(`data: ${JSON.stringify({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}\n\n`);
+        } else if (isIterablePlan(actionPlan)) {
+          res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}\n\n`);
         } else {
-          res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}
-\n`);
+          res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}\n\n`);
         }
       }
     }
@@ -823,7 +914,7 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     res.write(`data: ${JSON.stringify({
       type: "done",
       reply: result.reply,
-      actionPlan: result.actionPlan,
+      actionPlan: (result.toolCalls && result.toolCalls.length > 0) ? null : result.actionPlan,
       sessionId: session.id,
       retrievalCount: retrieved.length,
       citations: retrieved.map((c) => ({ id: c.id, fileName: c.fileName })),
@@ -877,6 +968,16 @@ function parseActionPlanFromToolCalls(
     explanation: actions.map((a) => a.description).join("；"),
   };
 }
+
+// SPA fallback: serve index.html for non-API routes
+app.get("*", (_req, res) => {
+  const indexPath = path.join(publicDir, "index.html");
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      res.status(404).json({ error: "Not found" });
+    }
+  });
+});
 
 app.listen(port, host, () => {
   console.log(`Local agent listening on http://${host}:${port}`);

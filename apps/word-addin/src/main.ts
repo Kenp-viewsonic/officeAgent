@@ -1,4 +1,7 @@
-const agentBase = "/api";
+// In production (bundled), API is on the same origin → empty string.
+// In development, Vite proxies "/api" to the local-agent server.
+// @ts-ignore __AGENT_BASE__ is injected by Vite at build time via `define`.
+const agentBase: string = typeof __AGENT_BASE__ !== "undefined" ? __AGENT_BASE__ : "/api";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -78,6 +81,7 @@ const state: {
   pendingActionPlan: ActionPlan | null;
   pendingSimpleInsert: SimpleInsertPlan | null;
   pendingSessionId: string | null;
+  pendingAttachment: { fileName: string; content: string } | null;
 } = {
   sessions: [],
   activeSessionId: null,
@@ -85,6 +89,7 @@ const state: {
   pendingActionPlan: null,
   pendingSimpleInsert: null,
   pendingSessionId: null,
+  pendingAttachment: null,
 };
 
 // ─── DOM Helpers ─────────────────────────────────────────────────────────────
@@ -108,6 +113,126 @@ const userInput = $<HTMLTextAreaElement>("userInput");
 const insertModeSelect = $<HTMLSelectElement>("insertMode");
 const actionPlanPanel = $<HTMLDivElement>("actionPlanPanel");
 const actionPlanContent = $<HTMLDivElement>("actionPlanContent");
+const fileInput = $<HTMLInputElement>("fileInput");
+const attachBtn = $<HTMLButtonElement>("attachBtn");
+const dropZone = $<HTMLDivElement>("dropZone");
+const dropOverlay = $<HTMLDivElement>("dropOverlay");
+const attachmentPreview = $<HTMLDivElement>("attachmentPreview");
+const attachmentName = $<HTMLSpanElement>("attachmentName");
+const attachmentSize = $<HTMLSpanElement>("attachmentSize");
+const removeAttachment = $<HTMLButtonElement>("removeAttachment");
+
+// ─── Attachment Helpers ─────────────────────────────────────────────────────
+
+const TEXT_EXTENSIONS = new Set([
+  ".txt", ".md", ".json", ".csv", ".xml", ".yaml", ".yml",
+  ".log", ".ini", ".cfg", ".conf", ".toml",
+  ".py", ".js", ".ts", ".java", ".c", ".cpp", ".h", ".hpp",
+  ".go", ".rs", ".rb", ".php", ".sh", ".bat", ".ps1",
+  ".sql", ".html", ".css", ".svg", ".tsx", ".jsx", ".vue", ".svelte",
+]);
+
+function isPlainTextFile(fileName: string): boolean {
+  const dot = fileName.lastIndexOf(".");
+  if (dot < 0) return false;
+  const ext = fileName.slice(dot).toLowerCase();
+  return TEXT_EXTENSIONS.has(ext);
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function readTextFile(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.readAsText(file, "utf-8");
+  });
+}
+
+function showAttachmentPreview(fileName: string, size: number): void {
+  attachmentName.textContent = `📄 ${fileName}`;
+  attachmentSize.textContent = formatFileSize(size);
+  attachmentPreview.style.display = "flex";
+}
+
+function hideAttachmentPreview(): void {
+  state.pendingAttachment = null;
+  attachmentPreview.style.display = "none";
+  attachmentName.textContent = "";
+  attachmentSize.textContent = "";
+}
+
+async function handleAttachmentFile(file: File): Promise<void> {
+  if (!isPlainTextFile(file.name)) {
+    setStatus(chatStatus, `不支持的文件类型，请选择纯文本文件`);
+    return;
+  }
+
+  try {
+    const content = await readTextFile(file);
+    state.pendingAttachment = { fileName: file.name, content };
+    showAttachmentPreview(file.name, file.size);
+    setStatus(chatStatus, `已附加 ${file.name}`);
+  } catch {
+    setStatus(chatStatus, "文件读取失败");
+  }
+}
+
+function setupAttachmentHandlers(): void {
+  // Button click
+  attachBtn.addEventListener("click", () => {
+    fileInput.click();
+  });
+
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files && fileInput.files.length > 0) {
+      void handleAttachmentFile(fileInput.files[0]);
+      fileInput.value = "";
+    }
+  });
+
+  // Remove attachment
+  removeAttachment.addEventListener("click", () => {
+    hideAttachmentPreview();
+    setStatus(chatStatus, "已移除附件");
+  });
+
+  // Drag and drop on the drop zone
+  dropZone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropOverlay.style.display = "flex";
+    userInput.classList.add("drag-over");
+  });
+
+  dropZone.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Only hide if actually leaving the drop zone (not entering a child)
+    const related = e.relatedTarget as Node | null;
+    if (!related || !dropZone.contains(related)) {
+      dropOverlay.style.display = "none";
+      userInput.classList.remove("drag-over");
+    }
+  });
+
+  dropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropOverlay.style.display = "none";
+    userInput.classList.remove("drag-over");
+
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) {
+      void handleAttachmentFile(files[0]);
+    }
+  });
+}
 
 // ─── Provider Config ────────────────────────────────────────────────────────
 
@@ -125,12 +250,144 @@ function setStatus(target: HTMLParagraphElement, text: string): void {
   target.textContent = text;
 }
 
-// ─── Chat Log ────────────────────────────────────────────────────────────────
+// ─── Chat Log Constants ──────────────────────────────────────────────────────
+
+const MAX_STORED_MESSAGES = 100; // keep last 100 messages in session
+const LAZY_RENDER_BATCH = 20; // initially render last 20, load 20 more on demand
+const LAZY_LOAD_THRESHOLD = 40; // px from top to trigger auto-load
+
+// ─── Chat Log Rendering ──────────────────────────────────────────────────────
+
+/**
+ * Parse content for XML tags and render as rich HTML.
+ * Supports: <thinking>/<reasoning> → collapsible block, Markdown → HTML
+ */
+function renderContentToHTML(content: string): string {
+  let html = "";
+  let lastEnd = 0;
+  let tagIndex = 0;
+
+  // Collect all <thinking>/<reasoning> block positions
+  const blocks: Array<{ start: number; end: number; inner: string; tag: string }> = [];
+  const thinkRe = /<thinking\b[^>]*>|<reasoning\b[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = thinkRe.exec(content)) !== null) {
+    const tagName = m[0].startsWith("<thinking") ? "thinking" : "reasoning";
+    const closeTag = `</${tagName}>`;
+    const closeIdx = content.indexOf(closeTag, m.index + m[0].length);
+    if (closeIdx === -1) continue;
+    const inner = content.slice(m.index + m[0].length, closeIdx).trim();
+    blocks.push({ start: m.index, end: closeIdx + closeTag.length, inner, tag: tagName });
+  }
+  // Sort and dedup overlapping blocks
+  blocks.sort((a, b) => a.start - b.start);
+  const merged: typeof blocks = [];
+  for (const b of blocks) {
+    if (merged.length > 0 && b.start < merged[merged.length - 1].end) continue;
+    merged.push(b);
+  }
+
+  for (const block of merged) {
+    // Render text before this block with Markdown
+    if (block.start > lastEnd) {
+      html += renderMarkdown(content.slice(lastEnd, block.start));
+    }
+    const label = block.tag === "reasoning" ? "推理" : "思考";
+    const emoji = block.tag === "reasoning" ? "🧠" : "💭";
+    const tagId = `think-${Date.now()}-${tagIndex++}`;
+    html += `<details class="think-block" id="${tagId}">`;
+    html += `<summary>${emoji} ${label}过程 (${block.inner.length} 字)</summary>`;
+    html += `<div class="think-content">${renderMarkdown(block.inner)}</div>`;
+    html += `</details>`;
+    lastEnd = block.end;
+  }
+
+  // Render remaining text after last block
+  if (lastEnd < content.length) {
+    html += renderMarkdown(content.slice(lastEnd));
+  }
+
+  return html;
+}
+
+/**
+ * Render a subset of Markdown to HTML. Inline-safe: runs after HTML escaping.
+ * Supports: **bold**, *italic*, `code`, ```code blocks```, - lists, ### headings.
+ */
+function renderMarkdown(text: string): string {
+  // First escape HTML
+  let out = escapeHTML(text);
+
+  // Fenced code blocks (before inline code to avoid conflict)
+  out = out.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    return `<pre><code>${code.trimEnd()}</code></pre>`;
+  });
+
+  // Inline code: `...` (single backtick pairs)
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  // Bold: **...** or __...__
+  out = out.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/__(.+?)__/g, "<strong>$1</strong>");
+
+  // Italic: *...* or _..._
+  out = out.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  out = out.replace(/_(.+?)_/g, "<em>$1</em>");
+
+  // Headings: ### text at line start
+  out = out.replace(/^### (.+)$/gm, "<h4>$1</h4>");
+  out = out.replace(/^## (.+)$/gm, "<h3>$1</h3>");
+  out = out.replace(/^# (.+)$/gm, "<h2>$1</h2>");
+
+  // Unordered list: - item or * item at line start
+  out = out.replace(/^[*-] (.+)$/gm, "<li>$1</li>");
+  // Wrap consecutive <li> in <ul>
+  out = out.replace(/(<li>[\s\S]*?<\/li>)/g, (_m, items) => {
+    if (!items.includes("\n<li>")) return _m;
+    return `<ul>${items.replace(/\n/g, "")}</ul>`;
+  });
+
+  // Line breaks: double newline → paragraph break
+  out = out.replace(/\n\n+/g, "<br><br>");
+  // Single newline → <br>
+  out = out.replace(/\n/g, "<br>");
+
+  return out;
+}
+
+function escapeHTML(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 function appendMessage(role: "user" | "assistant" | "system", content: string): void {
   const div = document.createElement("div");
   div.className = `msg ${role}`;
-  div.textContent = `${role === "user" ? "你" : role === "assistant" ? "助手" : "系统"}: ${content}`;
+  const label = role === "user" ? "你" : role === "assistant" ? "助手" : "系统";
+  div.innerHTML = `${label}: ${renderContentToHTML(content)}`;
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function appendToolCallCard(toolName: string, params: Record<string, any>): void {
+  const div = document.createElement("div");
+  div.className = "msg tool-call";
+  const paramStr = JSON.stringify(params, null, 0);
+  const shortName = toolName.replace(/_/g, " ");
+  div.innerHTML = `<div class="tc-header">🔧 调用: ${escapeHtml(shortName)}</div><div class="tc-params">${escapeHtml(paramStr.length > 300 ? paramStr.slice(0, 300) + "…" : paramStr)}</div>`;
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function appendToolResultCard(toolName: string, success: boolean, result: string): void {
+  const div = document.createElement("div");
+  div.className = `msg tool-result ${success ? "tr-ok" : "tr-fail"}`;
+  const shortName = toolName.replace(/_/g, " ");
+  const icon = success ? "✅" : "❌";
+  const body = result.length > 400 ? result.slice(0, 400) + "…" : result;
+  div.innerHTML = `<div class="tr-header">${icon} ${escapeHtml(shortName)}</div><div class="tr-body">${escapeHtml(body)}</div>`;
   chatLog.appendChild(div);
   chatLog.scrollTop = chatLog.scrollHeight;
 }
@@ -138,25 +395,115 @@ function appendMessage(role: "user" | "assistant" | "system", content: string): 
 function createAssistantMessage(initial = ""): HTMLDivElement {
   const div = document.createElement("div");
   div.className = "msg assistant";
-  div.textContent = `助手: ${initial}`;
+  div.innerHTML = `助手: ${initial ? renderContentToHTML(initial) : ""}`;
   chatLog.appendChild(div);
   chatLog.scrollTop = chatLog.scrollHeight;
   return div;
 }
 
 function updateAssistantMessage(el: HTMLDivElement, content: string): void {
-  el.textContent = `助手: ${content}`;
-  chatLog.scrollTop = chatLog.scrollHeight;
+  el.innerHTML = `助手: ${renderContentToHTML(content)}`;
+  // Don't auto-scroll during streaming to avoid jitter (user may be reading above)
 }
 
 function clearChatLog(): void {
   chatLog.innerHTML = "";
 }
 
+/**
+ * Render messages lazily: show last LAZY_RENDER_BATCH, add load-more button for older.
+ */
+function renderSessionMessages(messages: ChatMessage[]): void {
+  clearChatLog();
+  const visible = messages.filter((m) => m.role !== "system");
+
+  if (visible.length === 0) return;
+
+  const total = visible.length;
+  const startFrom = Math.max(0, total - LAZY_RENDER_BATCH);
+
+  // Insert load-older button if there are hidden messages
+  if (startFrom > 0) {
+    const loadBtn = document.createElement("div");
+    loadBtn.className = "load-older";
+    loadBtn.innerHTML = `<button id="loadOlderBtn">显示更早的 ${startFrom} 条对话</button>`;
+    chatLog.appendChild(loadBtn);
+
+    const loadOlderBtn = loadBtn.querySelector("#loadOlderBtn") as HTMLButtonElement;
+    if (loadOlderBtn) {
+      loadOlderBtn.addEventListener("click", () => {
+        loadOlderMessages(visible, startFrom);
+      });
+    }
+  }
+
+  // Render the last batch
+  for (let i = startFrom; i < total; i++) {
+    const msg = visible[i];
+    appendMessage(msg.role, msg.content);
+  }
+}
+
+function loadOlderMessages(visible: ChatMessage[], currentStart: number): void {
+  const loadBtn = chatLog.querySelector(".load-older");
+  if (loadBtn) loadBtn.remove();
+
+  const newStart = Math.max(0, currentStart - LAZY_RENDER_BATCH);
+  const fragment = document.createDocumentFragment();
+
+  for (let i = newStart; i < currentStart; i++) {
+    const msg = visible[i];
+    const div = document.createElement("div");
+    div.className = `msg ${msg.role}`;
+    const label = msg.role === "user" ? "你" : msg.role === "assistant" ? "助手" : "系统";
+    div.innerHTML = `${label}: ${renderContentToHTML(msg.content)}`;
+    fragment.appendChild(div);
+  }
+
+  // Insert remaining load-more or prepend
+  if (newStart > 0) {
+    const moreBtn = document.createElement("div");
+    moreBtn.className = "load-older";
+    moreBtn.innerHTML = `<button id="loadOlderBtn">显示更早的 ${newStart} 条对话</button>`;
+    fragment.appendChild(moreBtn);
+  }
+
+  // Insert before the first msg element
+  const firstMsg = chatLog.querySelector(".msg");
+  if (firstMsg) {
+    firstMsg.before(fragment);
+  } else {
+    chatLog.appendChild(fragment);
+  }
+
+  // Rebind the new load-older button
+  const newLoadBtn = chatLog.querySelector("#loadOlderBtn") as HTMLButtonElement;
+  if (newLoadBtn) {
+    newLoadBtn.addEventListener("click", () => {
+      loadOlderMessages(visible, newStart);
+    });
+  }
+}
+
+/**
+ * Trim session messages to stay within MAX_STORED_MESSAGES.
+ */
+function trimSessionMessages(session: Session): void {
+  if (session.messages.length > MAX_STORED_MESSAGES) {
+    const excess = session.messages.length - MAX_STORED_MESSAGES;
+    session.messages.splice(0, excess);
+    session.updatedAt = Date.now();
+  }
+}
+
 // ─── Markdown Cleanup ───────────────────────────────────────────────────────
 
 function cleanupMarkdownForWord(input: string): string {
   let text = input;
+
+  // Convert literal \\n (LLM-typed backslash-n) to real newlines first
+  text = text.replace(/\\n/g, "\n");
+  text = text.replace(/\\r\\n/g, "\r\n");
 
   text = text.replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-zA-Z0-9_-]*\n?|```/g, ""));
   text = text.replace(/^\s{0,3}#{1,6}\s+/gm, "");
@@ -239,6 +586,7 @@ function switchToSession(sessionId: string): void {
   const current = getActiveSession();
   if (current) {
     current.updatedAt = Date.now();
+    trimSessionMessages(current);
   }
   saveSessionsToStorage();
 
@@ -247,10 +595,7 @@ function switchToSession(sessionId: string): void {
   clearChatLog();
 
   if (target) {
-    for (const msg of target.messages) {
-      if (msg.role === "system") continue;
-      appendMessage(msg.role, msg.content);
-    }
+    renderSessionMessages(target.messages);
     state.lastReply = [...target.messages].reverse().find((m) => m.role === "assistant")?.content ?? "";
   } else {
     state.lastReply = "";
@@ -661,6 +1006,125 @@ async function saveProviderConfig(): Promise<void> {
   }
 }
 
+// ─── Config Presets ─────────────────────────────────────────────────────────
+
+type PresetView = {
+  id: string;
+  name: string;
+  config: { baseUrl: string; model: string; apiKey: string; temperature?: number; maxTokens?: number; firstTokenTimeout?: number; overallTimeout?: number };
+  createdAt: number;
+  updatedAt: number;
+};
+
+async function loadPresets(): Promise<void> {
+  const select = $<HTMLSelectElement>("presetSelect");
+  try {
+    const res = await fetch(`${agentBase}/v1/presets`);
+    if (!res.ok) return;
+    const data = (await res.json()) as { ok: boolean; presets: PresetView[] };
+    const presets = data.presets ?? [];
+
+    // Preserve current selection
+    const current = select.value;
+    select.innerHTML = '<option value="">-- 未保存的配置 --</option>';
+    for (const p of presets) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.name;
+      select.appendChild(opt);
+    }
+    if (current && presets.some((p) => p.id === current)) {
+      select.value = current;
+    }
+  } catch {
+    // Silent fail
+  }
+}
+
+async function loadPresetById(id: string): Promise<void> {
+  if (!id) return;
+  try {
+    const res = await fetch(`${agentBase}/v1/presets/${id}/activate`, { method: "POST" });
+    if (!res.ok) {
+      setStatus(configStatus, "加载方案失败");
+      return;
+    }
+    await loadProviderConfig();
+    setStatus(configStatus, "已加载方案");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    setStatus(configStatus, `加载方案失败: ${message}`);
+  }
+}
+
+async function saveCurrentAsPreset(): Promise<void> {
+  const name = prompt("请输入配置方案名称：");
+  if (!name) return;
+
+  const apiKey = $<HTMLInputElement>("apiKey").value.trim();
+  if (!apiKey) {
+    setStatus(configStatus, "请先填写 API Key 再保存方案");
+    return;
+  }
+
+  const preset = {
+    id: `preset_${Date.now()}`,
+    name,
+    config: {
+      baseUrl: $<HTMLInputElement>("baseUrl").value.trim(),
+      apiKey,
+      model: $<HTMLInputElement>("model").value.trim(),
+      temperature: Number($<HTMLInputElement>("temperature").value || "0.2"),
+      maxTokens: Number($<HTMLInputElement>("maxTokens").value || "900"),
+      firstTokenTimeout: Number($<HTMLInputElement>("firstTokenTimeout").value || "20"),
+      overallTimeout: Number($<HTMLInputElement>("overallTimeout").value || "240"),
+    },
+  };
+
+  try {
+    const res = await fetch(`${agentBase}/v1/presets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(preset),
+    });
+    if (!res.ok) {
+      setStatus(configStatus, "保存方案失败");
+      return;
+    }
+    await loadPresets();
+    $<HTMLSelectElement>("presetSelect").value = preset.id;
+    setStatus(configStatus, `方案「${name}」已保存`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    setStatus(configStatus, `保存方案失败: ${message}`);
+  }
+}
+
+async function deleteSelectedPreset(): Promise<void> {
+  const select = $<HTMLSelectElement>("presetSelect");
+  const id = select.value;
+  if (!id) {
+    setStatus(configStatus, "请先选择要删除的方案");
+    return;
+  }
+  const name = select.options[select.selectedIndex]?.textContent || id;
+  if (!confirm(`确定删除方案「${name}」？`)) return;
+
+  try {
+    const res = await fetch(`${agentBase}/v1/presets/${id}`, { method: "DELETE" });
+    if (!res.ok) {
+      setStatus(configStatus, "删除方案失败");
+      return;
+    }
+    select.value = "";
+    await loadPresets();
+    setStatus(configStatus, `方案「${name}」已删除`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    setStatus(configStatus, `删除方案失败: ${message}`);
+  }
+}
+
 // ─── Word Context (Structured) ───────────────────────────────────────────────
 
 async function getStructuredContext(): Promise<DocumentStructure> {
@@ -861,42 +1325,72 @@ async function readDocument(params: Record<string, any>): Promise<string> {
           return `未找到标题"${params.heading_text}"`;
         }
 
-        const startPara = matches.items[0].paragraphs.getFirst();
-        startPara.load(["text", "style"]);
+        // Load all matched paragraphs to find the actual heading (not TOC entries)
+        const allParagraphs = body.paragraphs;
+        allParagraphs.load("items");
         await context.sync();
 
-        const startLevelMatch = (startPara.style || "").toString().match(/Heading\s*(\d)/i);
-        const startLevel = startLevelMatch ? parseInt(startLevelMatch[1]) : 0;
+        // Find the paragraph index for each match
+        const matchInfos: Array<{ paraIndex: number; text: string; style: string; isHeading: boolean; level: number }> = [];
+        for (const match of matches.items) {
+          const firstPara = match.paragraphs.getFirst();
+          firstPara.load(["text", "style"]);
+          await context.sync();
+          const styleStr = (firstPara.style || "").toString();
+          const levelMatch = styleStr.match(/Heading\s*(\d)/i);
+          const level = levelMatch ? parseInt(levelMatch[1]) : 0;
+          const matchText = (firstPara.text || "").trim();
 
-        const paragraphs = body.paragraphs;
-        paragraphs.load("items");
-        await context.sync();
+          // Find the paragraph index in the body
+          for (let i = 0; i < allParagraphs.items.length; i++) {
+            if ((allParagraphs.items[i].text || "").trim() === matchText) {
+              matchInfos.push({ paraIndex: i, text: matchText, style: styleStr, isHeading: level > 0, level });
+              break;
+            }
+          }
+        }
 
+        if (matchInfos.length === 0) {
+          return `未找到标题"${params.heading_text}"`;
+        }
+
+        // Prefer the actual heading (Heading style) over TOC entries
+        const headingMatch = matchInfos.find((m) => m.isHeading);
+        const bestMatch = headingMatch || matchInfos[0];
+
+        // If there are multiple matches, report them all so the LLM knows
+        let multiMatchNote = "";
+        if (matchInfos.length > 1) {
+          const matchList = matchInfos.map((m) => `  [段落${m.paraIndex}] ${m.isHeading ? `标题${m.level}` : "普通文本"}: ${m.text}`).join("\n");
+          multiMatchNote = `\n⚠️ 找到 ${matchInfos.length} 处匹配，已自动选择${headingMatch ? "实际标题" : "第一个匹配"}（段落${bestMatch.paraIndex}）。所有匹配：\n${matchList}\n如需查看其他匹配项，请使用 read_document 的 paragraph_range 模式指定具体段落序号。\n`;
+        }
+
+        const startLevel = bestMatch.level;
         let found = false;
         const result: string[] = [];
-        for (let i = 0; i < paragraphs.items.length; i++) {
-          const p = paragraphs.items[i];
+        for (let i = 0; i < allParagraphs.items.length; i++) {
+          const p = allParagraphs.items[i];
           p.load(["text", "style"]);
           await context.sync();
 
-          const levelMatch = (p.style || "").toString().match(/Heading\s*(\d)/i);
-          const level = levelMatch ? parseInt(levelMatch[1]) : 0;
+          const pLevelMatch = (p.style || "").toString().match(/Heading\s*(\d)/i);
+          const pLevel = pLevelMatch ? parseInt(pLevelMatch[1]) : 0;
 
           if (!found) {
-            if (p.text.trim() === startPara.text.trim()) {
+            if (i === bestMatch.paraIndex) {
               found = true;
-              result.push(`[段落${i}] 标题${level} ${p.text}`);
+              result.push(`[段落${i}] 标题${pLevel} ${p.text}`);
             }
             continue;
           }
 
-          if (level > 0 && level <= startLevel) {
+          if (pLevel > 0 && pLevel <= startLevel) {
             break;
           }
           result.push(`[段落${i}] ${p.text}`);
         }
 
-        return `标题"${params.heading_text}"及其子内容：\n${result.join("\n")}`;
+        return `标题"${params.heading_text}"及其子内容：${multiMatchNote}\n${result.join("\n")}`;
       }
 
       case "selection": {
@@ -1178,6 +1672,98 @@ async function applyFormat(
   console.warn(`无法设置样式 "${format}"，所有候选名称均失败，将使用默认格式`);
 }
 
+/**
+ * Normalize content: convert literal two-char "\\n" sequences to real newlines,
+ * then split into lines. Also collapse excessive blank lines.
+ */
+function normalizeContentLines(content: string): string[] {
+  // Step 1: literal "\\n" (backslash + n, as typed by LLM) → real newline
+  let text = content.replace(/\\n/g, "\n");
+  // Step 2: also handle literal "\\r\\n"
+  text = text.replace(/\\r\\n/g, "\n");
+  // Step 3: collapse 3+ consecutive newlines into 2
+  text = text.replace(/\n{3,}/g, "\n\n");
+  // Split and filter out trailing empty string (but keep intentional blank lines)
+  const lines = text.split("\n");
+  // Remove trailing empty line if any (common LLM artifact)
+  if (lines.length > 1 && lines[lines.length - 1].trim() === "") {
+    lines.pop();
+  }
+  return lines;
+}
+
+/**
+ * Insert multi-line content as multiple paragraphs after a reference paragraph.
+ * Returns the last inserted paragraph.
+ */
+async function insertMultiParagraphAfter(
+  anchor: Word.Paragraph,
+  content: string,
+  format: string,
+  context: Word.RequestContext
+): Promise<Word.Paragraph> {
+  const lines = normalizeContentLines(content);
+  let lastPara: Word.Paragraph = anchor;
+  for (let i = 0; i < lines.length; i++) {
+    const newPara = lastPara.insertParagraph(lines[i] || " ", "After");
+    await applyFormat(newPara, format, context);
+    lastPara = newPara;
+  }
+  return lastPara;
+}
+
+/**
+ * Insert multi-line content as multiple paragraphs at the end of the body.
+ * Returns the last inserted paragraph.
+ */
+async function insertMultiParagraphAtEnd(
+  body: Word.Body,
+  content: string,
+  format: string,
+  context: Word.RequestContext
+): Promise<Word.Paragraph> {
+  const lines = normalizeContentLines(content);
+  let lastPara: Word.Paragraph | null = null;
+  for (const line of lines) {
+    try {
+      const anchor: Word.Paragraph = lastPara ?? body.paragraphs.getLast();
+      const newPara: Word.Paragraph = anchor.insertParagraph(line || " ", "After");
+      await applyFormat(newPara, format, context);
+      lastPara = newPara;
+    } catch {
+      const newPara: Word.Paragraph = body.insertParagraph(line || " ", "End");
+      await applyFormat(newPara, format, context);
+      lastPara = newPara;
+    }
+  }
+  return lastPara!;
+}
+
+/**
+ * Insert multi-line content as multiple paragraphs at the start of the body.
+ * Returns the first inserted paragraph.
+ */
+async function insertMultiParagraphAtStart(
+  body: Word.Body,
+  content: string,
+  format: string,
+  context: Word.RequestContext
+): Promise<Word.Paragraph> {
+  const lines = normalizeContentLines(content);
+  // Insert lines in reverse order before the first paragraph so they end up in correct order
+  const firstPara = body.paragraphs.getFirst();
+  let anchor = firstPara;
+  // We need to insert from last to first so order is preserved
+  let firstInserted: Word.Paragraph | null = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const newPara = anchor.insertParagraph(lines[i] || " ", "Before");
+    await applyFormat(newPara, format, context);
+    anchor = newPara;
+    firstInserted = newPara;
+  }
+  return firstInserted!;
+}
+
 async function executeAction(action: WordAction): Promise<string> {
   if (typeof Word === "undefined") {
     throw new Error("当前不在 Word 宿主中");
@@ -1206,10 +1792,15 @@ async function executeAction(action: WordAction): Promise<string> {
             await context.sync();
             return `已在"${heading_text}"后插入 HTML 格式内容`;
           }
-          const newPara = paragraph.insertParagraph(content, "After");
-          await context.sync();
-          await applyFormat(newPara, format, context);
-          return `已在"${heading_text}"后插入内容`;
+          const lines = normalizeContentLines(String(content));
+          if (lines.length <= 1) {
+            const newPara = paragraph.insertParagraph(String(content), "After");
+            await context.sync();
+            await applyFormat(newPara, format, context);
+          } else {
+            await insertMultiParagraphAfter(paragraph, String(content), format, context);
+          }
+          return `已在"${heading_text}"后插入内容（${lines.length} 段）`;
         }
         const lastPara = body.paragraphs.getLast();
         if (isHtml) {
@@ -1217,10 +1808,15 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return `未找到标题"${heading_text}"，已插入 HTML 格式内容到文档末尾`;
         }
-        const newPara = lastPara.insertParagraph(content, "After");
-        await context.sync();
-        await applyFormat(newPara, format, context);
-        return `未找到标题"${heading_text}"，已插入到文档末尾`;
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          const newPara = lastPara.insertParagraph(String(content), "After");
+          await context.sync();
+          await applyFormat(newPara, format, context);
+        } else {
+          await insertMultiParagraphAfter(lastPara, String(content), format, context);
+        }
+        return `未找到标题"${heading_text}"，已插入到文档末尾（${lines.length} 段）`;
       }
 
       case "replace_selection": {
@@ -1234,9 +1830,17 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return "已替换选区内容（HTML 格式）";
         }
-        const para = selection.insertParagraph(content, "Replace");
-        await context.sync();
-        await applyFormat(para, format, context);
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          const para = selection.insertParagraph(String(content), "Replace");
+          await context.sync();
+          await applyFormat(para, format, context);
+        } else {
+          // Insert first line as replacement, then add remaining lines after
+          const firstPara = selection.insertParagraph(lines[0] || " ", "Replace");
+          await applyFormat(firstPara, format, context);
+          await insertMultiParagraphAfter(firstPara, lines.slice(1).join("\n"), format, context);
+        }
         return "已替换选区内容";
       }
 
@@ -1254,16 +1858,21 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return "已追加 HTML 格式内容到文档末尾";
         }
-        let newPara: Word.Paragraph;
-        try {
-          const lastPara = body.paragraphs.getLast();
-          newPara = lastPara.insertParagraph(String(content), "After");
-        } catch {
-          newPara = body.insertParagraph(String(content), "End");
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          let newPara: Word.Paragraph;
+          try {
+            const lastPara = body.paragraphs.getLast();
+            newPara = lastPara.insertParagraph(String(content), "After");
+          } catch {
+            newPara = body.insertParagraph(String(content), "End");
+          }
+          await context.sync();
+          await applyFormat(newPara, format, context);
+        } else {
+          await insertMultiParagraphAtEnd(body, String(content), format, context);
         }
-        await context.sync();
-        await applyFormat(newPara, format, context);
-        return "已追加到文档末尾";
+        return `已追加到文档末尾（${lines.length} 段）`;
       }
 
       case "insert_at_start": {
@@ -1280,18 +1889,23 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return "已插入 HTML 格式内容到文档开头";
         }
-        let newPara: Word.Paragraph;
-        try {
-          const firstPara = body.paragraphs.getFirst();
-          firstPara.load("text");
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          let newPara: Word.Paragraph;
+          try {
+            const firstPara = body.paragraphs.getFirst();
+            firstPara.load("text");
+            await context.sync();
+            newPara = firstPara.insertParagraph(String(content), "Before");
+          } catch (e) {
+            newPara = body.insertParagraph(String(content), "Start");
+          }
           await context.sync();
-          newPara = firstPara.insertParagraph(String(content), "Before");
-        } catch (e) {
-          newPara = body.insertParagraph(String(content), "Start");
+          await applyFormat(newPara, format, context);
+        } else {
+          await insertMultiParagraphAtStart(body, String(content), format, context);
         }
-        await context.sync();
-        await applyFormat(newPara, format, context);
-        return "已插入到文档开头";
+        return `已插入到文档开头（${lines.length} 段）`;
       }
 
       case "insert_after_paragraph": {
@@ -1310,10 +1924,15 @@ async function executeAction(action: WordAction): Promise<string> {
             await context.sync();
             return `已在段落 ${paragraph_index} 后插入 HTML 格式内容`;
           }
-          const newPara = paragraphs.items[paragraph_index].insertParagraph(content, "After");
-          await context.sync();
-          await applyFormat(newPara, format, context);
-          return `已在段落 ${paragraph_index} 后插入内容`;
+          const lines = normalizeContentLines(String(content));
+          if (lines.length <= 1) {
+            const newPara = paragraphs.items[paragraph_index].insertParagraph(String(content), "After");
+            await context.sync();
+            await applyFormat(newPara, format, context);
+          } else {
+            await insertMultiParagraphAfter(paragraphs.items[paragraph_index], String(content), format, context);
+          }
+          return `已在段落 ${paragraph_index} 后插入内容（${lines.length} 段）`;
         }
         const lastPara = body.paragraphs.getLast();
         if (isHtml) {
@@ -1321,10 +1940,15 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return `段落序号 ${paragraph_index} 超出范围，已插入 HTML 格式内容到末尾`;
         }
-        const newPara = lastPara.insertParagraph(content, "After");
-        await context.sync();
-        await applyFormat(newPara, format, context);
-        return `段落序号 ${paragraph_index} 超出范围，已插入到末尾`;
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          const newPara = lastPara.insertParagraph(String(content), "After");
+          await context.sync();
+          await applyFormat(newPara, format, context);
+        } else {
+          await insertMultiParagraphAfter(lastPara, String(content), format, context);
+        }
+        throw new Error(`insert_after_paragraph 失败：段落序号 ${paragraph_index} 超出范围（文档共 ${paragraphs.items.length} 段）。请先调用 read_document 确认段落序号。`);
       }
 
       case "delete_paragraph": {
@@ -1338,12 +1962,12 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return `已删除段落 ${paragraph_index}`;
         }
-        return `段落序号 ${paragraph_index} 超出范围，未执行删除`;
+        throw new Error(`delete_paragraph 失败：段落序号 ${paragraph_index} 超出范围（文档共 ${paragraphs.items.length} 段）。请先调用 read_document 确认段落序号。`);
       }
 
       case "find_and_replace": {
-        const { find_text, replace_text } = action.params;
-        const ranges = body.search(find_text, { matchCase: true, matchWholeWord: false });
+        const { find_text, replace_text, match_case = false } = action.params;
+        const ranges = body.search(find_text, { matchCase: match_case, matchWholeWord: false });
         ranges.load("items");
         await context.sync();
 
@@ -1353,7 +1977,7 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return `已替换 ${ranges.items.length} 处匹配中的第 1 处`;
         }
-        return `未找到"${find_text}"`;
+        throw new Error(`find_and_replace 失败：未找到"${find_text}"。请检查查找文本是否正确，或尝试使用 find_and_replace_v2 配合 match_case=false。`);
       }
 
       case "read_document": {
@@ -1387,10 +2011,18 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return "已在光标处插入 HTML 格式内容";
         }
-        const para = selection.insertParagraph(String(content), "Replace");
-        await context.sync();
-        await applyFormat(para, format, context);
-        return "已在光标处插入内容";
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          const para = selection.insertParagraph(String(content), "Replace");
+          await context.sync();
+          await applyFormat(para, format, context);
+        } else {
+          // Insert first line at cursor, then add remaining lines after
+          const firstPara = selection.insertParagraph(lines[0] || " ", "Replace");
+          await applyFormat(firstPara, format, context);
+          await insertMultiParagraphAfter(firstPara, lines.slice(1).join("\n"), format, context);
+        }
+        return `已在光标处插入内容（${lines.length} 段）`;
       }
 
       case "find_and_replace_v2": {
@@ -1427,9 +2059,16 @@ async function executeAction(action: WordAction): Promise<string> {
           await context.sync();
           return `已替换段落 ${paragraph_index} 的内容（HTML 格式）`;
         }
-        para.getRange("Whole").insertText(String(content), "Replace");
-        await context.sync();
-        return `已替换段落 ${paragraph_index} 的内容`;
+        // If content has newlines, replace current paragraph and insert remaining as new paragraphs after
+        const lines = normalizeContentLines(String(content));
+        if (lines.length <= 1) {
+          para.getRange("Whole").insertText(String(content), "Replace");
+          await context.sync();
+        } else {
+          para.getRange("Whole").insertText(lines[0] || " ", "Replace");
+          await insertMultiParagraphAfter(para, lines.slice(1).join("\n"), "normal", context);
+        }
+        return `已替换段落 ${paragraph_index} 的内容（${lines.length} 段）`;
       }
 
       case "set_paragraph_style": {
@@ -1530,6 +2169,15 @@ async function executeAction(action: WordAction): Promise<string> {
         // No document operation needed — this signals agent loop completion
         return action.params.summary || "任务已完成";
 
+      case "undo_last_action": {
+        const count = action.params.count || 1;
+        const doc = context.document;
+        // Word JS API 1.3+ supports document.undo(count), but local type defs may not include it
+        (doc as any).undo(count);
+        await context.sync();
+        return `已撤销最近 ${count} 步操作`;
+      }
+
       default:
         return `未知操作: ${action.action}`;
     }
@@ -1570,6 +2218,7 @@ async function executeActionPlan(plan: ActionPlan): Promise<Array<{ toolCallId: 
     const action = plan.actions[i];
     try {
       const result = await executeAction(action);
+      appendToolResultCard(action.action, true, result);
       results.push({
         toolCallId: action.toolCallId ?? `action-${i}`,
         toolName: action.action,
@@ -1578,6 +2227,7 @@ async function executeActionPlan(plan: ActionPlan): Promise<Array<{ toolCallId: 
       });
     } catch (error) {
       const { message, details } = stringifyOfficeError(error);
+      appendToolResultCard(action.action, false, `错误: ${message}`);
       results.push({
         toolCallId: action.toolCallId ?? `action-${i}`,
         toolName: action.action,
@@ -1602,6 +2252,11 @@ async function executeActionPlan(plan: ActionPlan): Promise<Array<{ toolCallId: 
 
 function showActionPlanPreview(plan: ActionPlan): void {
   state.pendingActionPlan = plan;
+
+  // Show tool call cards in chat log for visibility
+  for (const action of plan.actions) {
+    appendToolCallCard(action.action, action.params);
+  }
 
   // Build preview content
   let html = `<div class="action-plan-explanation">${escapeHtml(plan.explanation)}</div>`;
@@ -1667,6 +2322,7 @@ async function confirmActionPlan(): Promise<void> {
       if (activeSession && data.reply) {
         activeSession.messages.push({ role: "assistant", content: data.reply });
         activeSession.updatedAt = Date.now();
+        trimSessionMessages(activeSession);
         saveSessionsToStorage();
       }
 
@@ -1824,6 +2480,7 @@ type AgentStreamEvent =
   | { type: "start"; ts: number }
   | { type: "delta"; delta: string }
   | { type: "tool_call"; tools: Array<{ id: string; tool: string; params: Record<string, any> }> }
+  | { type: "iterable_tool_call"; tools: Array<{ id: string; tool: string; params: Record<string, any> }> }
   | { type: "action_plan"; plan: ActionPlan }
   | { type: "task_complete"; summary: string }
   | { type: "session"; sessionId: string }
@@ -1907,6 +2564,44 @@ async function executeSingleTool(
   }
 }
 
+/** Tools that change paragraph indices (like iterator invalidation) */
+const STRUCTURE_MUTATING_TOOLS = new Set([
+  "insert_after_paragraph", "insert_after_heading", "insert_at_start", "insert_at_end",
+  "delete_paragraph", "merge_paragraphs", "undo_last_action",
+]);
+
+/**
+ * After a structure-mutating tool executes, automatically call read_document
+ * to refresh paragraph indices — prevents stale-index bugs (LLM "iterator invalidation").
+ */
+async function autoReadAfterMutation(
+  executedTools: Array<{ tool: string; params: Record<string, any> }>,
+  results: Array<{ toolCallId: string; toolName: string; result: string; success: boolean }>
+): Promise<Array<{ toolCallId: string; toolName: string; result: string; success: boolean }>> {
+  const lastMutation = [...results].reverse().find(r => r.success && STRUCTURE_MUTATING_TOOLS.has(r.toolName));
+  if (!lastMutation) return results;
+
+  // Find the params of the last mutating tool to determine read range
+  const lastExecuted = [...executedTools].reverse().find(t => STRUCTURE_MUTATING_TOOLS.has(t.tool));
+  let readParams: Record<string, any> = { mode: "paragraph_range", paragraph_index: 0, count: 15 };
+  if (lastExecuted?.params) {
+    const pIdx = lastExecuted.params.paragraph_index;
+    if (typeof pIdx === "number") {
+      readParams = { mode: "paragraph_range", paragraph_index: Math.max(0, pIdx - 2), count: 15 };
+    }
+  }
+
+  const readResult = await executeSingleTool({
+    id: `auto-read-${Date.now()}`,
+    tool: "read_document",
+    params: readParams,
+  });
+  appendToolCallCard("read_document", readParams);
+  appendToolResultCard("read_document", readResult.success, readResult.result);
+  results.push(readResult);
+  return results;
+}
+
 async function sendAgentMessageStream(
   payload: {
     messages: ChatMessage[];
@@ -1916,7 +2611,7 @@ async function sendAgentMessageStream(
     insertMode: InsertMode;
   },
   onDelta: (text: string) => void,
-  maxIterations = 5
+  maxIterations = 10
 ): Promise<{
   reply: string;
   actionPlan: ActionPlan | null;
@@ -1980,9 +2675,26 @@ async function sendAgentMessageStream(
             return { reply: finalReply || plan.explanation, actionPlan: plan, retrievalCount: finalRetrievalCount, citations: finalCitations, sessionId: sessionId ?? undefined };
           }
 
+          appendToolCallCard(tool.tool, tool.params);
           const result = await executeSingleTool(tool);
+          appendToolResultCard(tool.tool, result.success, result.result);
           toolResults.push(result);
         }
+      }
+
+      // Iterable tool calls: execute action tools directly and continue loop (no user confirmation needed)
+      if (event.type === "iterable_tool_call") {
+        hasToolCall = true;
+        const executedTools: Array<{ tool: string; params: Record<string, any> }> = [];
+        for (const tool of event.tools) {
+          appendToolCallCard(tool.tool, tool.params);
+          const result = await executeSingleTool(tool);
+          appendToolResultCard(tool.tool, result.success, result.result);
+          toolResults.push(result);
+          executedTools.push({ tool: tool.tool, params: tool.params });
+        }
+        // Auto-read after structure-mutating tools to refresh paragraph indices
+        await autoReadAfterMutation(executedTools, toolResults);
       }
 
       if (event.type === "action_plan") {
@@ -2065,9 +2777,26 @@ async function continueAgentLoop(
             };
             return { reply: finalReply || plan.explanation, actionPlan: plan, sessionId, retrievalCount: finalRetrievalCount, citations: finalCitations };
           }
+          appendToolCallCard(tool.tool, tool.params);
           const result = await executeSingleTool(tool);
+          appendToolResultCard(tool.tool, result.success, result.result);
           currentToolResults.push(result);
         }
+      }
+
+      // Iterable tool calls: execute action tools directly and continue loop
+      if (event.type === "iterable_tool_call") {
+        hasToolCall = true;
+        const executedTools: Array<{ tool: string; params: Record<string, any> }> = [];
+        for (const tool of event.tools) {
+          appendToolCallCard(tool.tool, tool.params);
+          const result = await executeSingleTool(tool);
+          appendToolResultCard(tool.tool, result.success, result.result);
+          currentToolResults.push(result);
+          executedTools.push({ tool: tool.tool, params: tool.params });
+        }
+        // Auto-read after structure-mutating tools to refresh paragraph indices
+        await autoReadAfterMutation(executedTools, currentToolResults);
       }
 
       if (event.type === "action_plan") {
@@ -2188,7 +2917,7 @@ async function sendMessageStream(
 
 async function sendMessage(): Promise<void> {
   const text = userInput.value.trim();
-  if (!text) {
+  if (!text && !state.pendingAttachment) {
     setStatus(chatStatus, "请输入消息");
     return;
   }
@@ -2206,17 +2935,30 @@ async function sendMessage(): Promise<void> {
   }
 
   userInput.value = "";
-  appendMessage("user", text);
 
-  // Build the actual prompt sent to LLM
+  // Build display message (with attachment indicator)
+  let displayText = text;
+  if (state.pendingAttachment) {
+    const attachInfo = `[附件: ${state.pendingAttachment.fileName}]`;
+    displayText = text ? `${text}\n${attachInfo}` : attachInfo;
+  }
+  appendMessage("user", displayText);
+
+  // Build the actual prompt sent to LLM (with file content injected)
   let llmPrompt = text;
+  if (state.pendingAttachment) {
+    const fileBlock = `\n\n--- 以下是附加文件 "${state.pendingAttachment.fileName}" 的内容 ---\n${state.pendingAttachment.content}\n--- 文件内容结束 ---`;
+    llmPrompt = llmPrompt ? `${llmPrompt}${fileBlock}` : `请阅读以下附加文件内容：${fileBlock}`;
+    hideAttachmentPreview();
+  }
   if (insertMode !== "chat_only") {
-    llmPrompt = `${text}\n\n请根据文档结构和用户意图选择合适的工具来操作文档。`;
+    llmPrompt = `${llmPrompt}\n\n请根据文档结构和用户意图选择合适的工具来操作文档。`;
   }
 
   // Store original user message in session
   const activeSession = getActiveSession()!;
-  activeSession.messages.push({ role: "user", content: text });
+  activeSession.messages.push({ role: "user", content: llmPrompt });
+  trimSessionMessages(activeSession);
   autoTitleFromFirstMessage(activeSession);
 
   setStatus(chatStatus, "思考中（流式返回）...");
@@ -2245,6 +2987,7 @@ async function sendMessage(): Promise<void> {
       messagesForLlm.push({ role: "user", content: llmPrompt });
     }
 
+    const maxIter = Number($<HTMLInputElement>("maxIterations").value) || 10;
     const data = useAgentLoop
       ? await sendAgentMessageStream(
           {
@@ -2256,7 +2999,8 @@ async function sendMessage(): Promise<void> {
           },
           (partial) => {
             updateAssistantMessage(assistantEl, partial);
-          }
+          },
+          maxIter
         )
       : await sendMessageStream(
           {
@@ -2276,6 +3020,7 @@ async function sendMessage(): Promise<void> {
 
     state.lastReply = data.reply;
     activeSession.messages.push({ role: "assistant", content: data.reply });
+    trimSessionMessages(activeSession);
     activeSession.updatedAt = Date.now();
 
     const citationText = data.citations?.length
@@ -2370,6 +3115,22 @@ function bindActions(): void {
     void refreshModelList();
   });
 
+  // Config presets
+  $("presetSelect").addEventListener("change", () => {
+    const id = $<HTMLSelectElement>("presetSelect").value;
+    if (id) void loadPresetById(id);
+  });
+  $("loadPreset").addEventListener("click", () => {
+    const id = $<HTMLSelectElement>("presetSelect").value;
+    if (id) void loadPresetById(id);
+  });
+  $("savePreset").addEventListener("click", () => {
+    void saveCurrentAsPreset();
+  });
+  $("deletePreset").addEventListener("click", () => {
+    void deleteSelectedPreset();
+  });
+
   // Knowledge base
   $("uploadFile").addEventListener("click", () => {
     void uploadKnowledgeFile();
@@ -2392,13 +3153,23 @@ function bindActions(): void {
     void importKb();
   });
 
-  // Menu toggle
-  $("menuToggle").addEventListener("click", () => {
-    const card = document.getElementById("menuCard") as HTMLDetailsElement | null;
-    if (card) {
-      card.open = !card.open;
-    }
-  });
+  // Menu toggle (sidebar)
+  const sidebar = document.getElementById("menuSidebar")!;
+  const overlay = document.getElementById("sidebarOverlay")!;
+  const sidebarClose = document.getElementById("sidebarClose")!;
+
+  function openSidebar() {
+    sidebar.classList.add("open");
+    overlay.classList.add("active");
+  }
+  function closeSidebar() {
+    sidebar.classList.remove("open");
+    overlay.classList.remove("active");
+  }
+
+  $("menuToggle").addEventListener("click", openSidebar);
+  sidebarClose.addEventListener("click", closeSidebar);
+  overlay.addEventListener("click", closeSidebar);
 
   // Chat
   $("sendMsg").addEventListener("click", () => {
@@ -2481,7 +3252,9 @@ Office.onReady(() => {
   }
 
   bindActions();
+  setupAttachmentHandlers();
   void loadProviderConfig();
+  void loadPresets();
   void loadKbStats();
   void loadKbFileList();
   setStatus(chatStatus, "就绪：可直接开始对话");
