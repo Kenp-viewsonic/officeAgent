@@ -1062,17 +1062,13 @@ async function saveCurrentAsPreset(): Promise<void> {
   if (!name) return;
 
   const apiKey = $<HTMLInputElement>("apiKey").value.trim();
-  if (!apiKey) {
-    setStatus(configStatus, "请先填写 API Key 再保存方案");
-    return;
-  }
 
   const preset = {
     id: `preset_${Date.now()}`,
     name,
     config: {
       baseUrl: $<HTMLInputElement>("baseUrl").value.trim(),
-      apiKey,
+      ...(apiKey ? { apiKey } : {}),
       model: $<HTMLInputElement>("model").value.trim(),
       temperature: Number($<HTMLInputElement>("temperature").value || "0.2"),
       maxTokens: Number($<HTMLInputElement>("maxTokens").value || "900"),
@@ -1158,13 +1154,15 @@ async function getStructuredContext(): Promise<DocumentStructure> {
         const p = paragraphs.items[i];
         p.load(["text", "style", "isListItem"]);
         p.font.load(["name", "size", "color", "bold", "italic"]);
+        (p as any).inlinePictures.load("items");
       }
       await context.sync();
 
       for (let i = 0; i < Math.min(paragraphs.items.length, MAX_PARAGRAPHS); i++) {
         const p = paragraphs.items[i];
         const text = (p.text || "").trim();
-        if (!text) continue;
+        const imgCount = (p as any).inlinePictures.items.length;
+        if (!text && imgCount === 0) continue;
 
         const style = (p.style || "Normal").toString();
         const headingMatch = style.match(/Heading\s*(\d)/i);
@@ -1176,7 +1174,7 @@ async function getStructuredContext(): Promise<DocumentStructure> {
         const hasFont = fontName || fontSize || fontColor || fontBold || fontItalic;
         paraList.push({
           index: i,
-          text: text.slice(0, MAX_TEXT_LENGTH),
+          text: (imgCount > 0 && !text ? "（图片段落，无文字）" : text).slice(0, MAX_TEXT_LENGTH) + (imgCount > 0 ? ` [📷图片×${imgCount}]` : ""),
           style,
           headingLevel: headingMatch ? parseInt(headingMatch[1]) : undefined,
           isTable: false,
@@ -1290,6 +1288,7 @@ async function readDocument(params: Record<string, any>): Promise<string> {
           const p = paragraphs.items[i];
           p.load(["text", "style", "isListItem"]);
           p.font.load(["name", "size", "color", "bold", "italic"]);
+          (p as any).inlinePictures.load("items");
         }
         await context.sync();
 
@@ -1305,7 +1304,10 @@ async function readDocument(params: Record<string, any>): Promise<string> {
           if (p.font.italic) fontParts.push("斜体");
           if (p.font.color && !["#000000", "#000000ff", "#000"].includes((p.font.color || "").toLowerCase())) fontParts.push(p.font.color);
           const fontStr = fontParts.length > 0 ? ` [${fontParts.join(" ")}]` : "";
-          result.push(`[段落${i}] ${headingLevel ? `标题${headingLevel} ` : ""}${p.text || ""}${fontStr}`);
+          const imgCount = (p as any).inlinePictures.items.length;
+          const imgStr = imgCount > 0 ? ` [📷图片×${imgCount}]` : "";
+          const displayText = p.text || (imgCount > 0 ? "（图片段落，无文字）" : "");
+          result.push(`[段落${i}] ${headingLevel ? `标题${headingLevel} ` : ""}${displayText}${imgStr}${fontStr}`);
         }
 
         return result.length
@@ -1371,6 +1373,7 @@ async function readDocument(params: Record<string, any>): Promise<string> {
         for (let i = 0; i < allParagraphs.items.length; i++) {
           const p = allParagraphs.items[i];
           p.load(["text", "style"]);
+          (p as any).inlinePictures.load("items");
           await context.sync();
 
           const pLevelMatch = (p.style || "").toString().match(/Heading\s*(\d)/i);
@@ -1379,7 +1382,9 @@ async function readDocument(params: Record<string, any>): Promise<string> {
           if (!found) {
             if (i === bestMatch.paraIndex) {
               found = true;
-              result.push(`[段落${i}] 标题${pLevel} ${p.text}`);
+              const imgCount = (p as any).inlinePictures.items.length;
+              const imgStr = imgCount > 0 ? ` [📷图片×${imgCount}]` : "";
+              result.push(`[段落${i}] 标题${pLevel} ${p.text}${imgStr}`);
             }
             continue;
           }
@@ -1387,7 +1392,10 @@ async function readDocument(params: Record<string, any>): Promise<string> {
           if (pLevel > 0 && pLevel <= startLevel) {
             break;
           }
-          result.push(`[段落${i}] ${p.text}`);
+          const imgCount = (p as any).inlinePictures.items.length;
+          const imgStr = imgCount > 0 ? ` [📷图片×${imgCount}]` : "";
+          const displayText = p.text || (imgCount > 0 ? "（图片段落，无文字）" : "");
+          result.push(`[段落${i}] ${displayText}${imgStr}`);
         }
 
         return `标题"${params.heading_text}"及其子内容：${multiMatchNote}\n${result.join("\n")}`;

@@ -121,7 +121,7 @@ const presetSchema = z.object({
   name: z.string().min(1),
   config: z.object({
     baseUrl: z.string().url(),
-    apiKey: z.string().min(1),
+    apiKey: z.string().min(1).optional(),
     model: z.string().min(1),
     temperature: z.number().min(0).max(2).optional(),
     maxTokens: z.number().int().positive().optional(),
@@ -145,7 +145,17 @@ app.post("/v1/presets", async (req, res) => {
   if (!result.success) {
     return res.status(400).json({ error: "Invalid preset", details: result.error.flatten() });
   }
-  const presets = await savePreset(result.data as ConfigPreset);
+  // If apiKey not provided in preset, inherit from current config
+  const presetData = result.data;
+  if (!presetData.config.apiKey) {
+    const current = await loadProviderConfig();
+    if (current?.apiKey) {
+      presetData.config.apiKey = current.apiKey;
+    } else {
+      return res.status(400).json({ error: "API Key is required. Please save a config with API Key first, or provide apiKey in the preset." });
+    }
+  }
+  const presets = await savePreset(presetData as ConfigPreset);
   const safe = presets.map((p) => ({
     ...p,
     config: { ...p.config, apiKey: "***" },
@@ -487,7 +497,7 @@ app.post("/v1/chat/stream", async (req, res) => {
 
 const agentStreamSchema = chatSchema.extend({
   enableReAct: z.boolean().optional(),
-  maxIterations: z.number().int().min(1).max(10).optional(),
+  maxIterations: z.number().int().min(1).optional(),
 });
 
 async function runAgentIteration(
