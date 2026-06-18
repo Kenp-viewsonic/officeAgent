@@ -1,4 +1,5 @@
 import { ChatMessage, ProviderConfig, RetrievalChunk, ToolDefinition, ActionPlan, WordAction } from "./types.js";
+import { logRequestStart, logResponseRaw, logResponseParsed, logError } from "./agent-logger.js";
 
 type ChatCompletionResponse = {
   choices?: Array<{
@@ -453,8 +454,7 @@ export function describeDocumentStructure(structure: {
 
 function buildSystemPrompt(
   hasTools: boolean,
-  insertMode: string,
-  documentStructureDescription?: string
+  insertMode: string
 ): ChatMessage {
   let content = `你是一个面向 Word 文档编辑的智能 Agent。你的工作是理解用户意图，通过「感知 → 思考 → 操作」的循环来完成任务。
 
@@ -702,18 +702,34 @@ function buildSystemPrompt(
 当前模式为「智能操作」，请根据用户意图自主选择最合适的工具。建议在不确定时先调用感知类工具确认文档状态。`;
   }
 
-  if (documentStructureDescription) {
-    content += `
-
-当前文档结构：
-${documentStructureDescription}`;
-  }
+  // NOTE: documentStructureDescription is intentionally NOT appended here.
+  // It is high-frequency changing content (cursor moves, edits) and would
+  // break the LLM provider's prefix-based prompt cache (DeepSeek context
+  // caching, llama.cpp KV cache). It is injected as a trailing system
+  // message in buildPayload() instead, keeping this system prompt as a
+  // stable prefix that can be cached across requests.
 
   return { role: "system", content };
 }
 
 // --- Build payload ---
 
+/**
+ * Build the final messages array sent to the LLM.
+ *
+ * Message ordering is optimized for prefix-based prompt caching
+ * (DeepSeek context caching, llama.cpp KV cache, Anthropic prompt cache):
+ *
+ *   [1] system: stable tool instructions + core rules (buildSystemPrompt)
+ *   [2] ...conversation history (user / assistant / tool)...
+ *   [3] system: dynamic context (retrieved chunks + document structure +
+ *               document context + selection) — high-frequency changing,
+ *               placed at the END so it does not break the cached prefix.
+ *
+ * Previously, retrieved chunks were the 2nd message and document structure
+ * was appended to the system prompt, which made the stable prefix length ~0
+ * and cache hit rate near zero.
+ */
 function buildPayload(
   config: ProviderConfig,
   messages: ChatMessage[],
@@ -721,19 +737,14 @@ function buildPayload(
   stream: boolean,
   tools?: ToolDefinition[],
   insertMode?: string,
-  documentStructureDescription?: string
+  documentStructureDescription?: string,
+  dynamicContext?: { documentContext?: string; selection?: string }
 ): Record<string, any> {
   const contextText = contextChunks.map((chunk, idx) => `[${idx + 1}] ${chunk.fileName}: ${chunk.text}`).join("\n\n");
 
   const hasTools = !!(tools && tools.length > 0);
-  const systemPrompt = buildSystemPrompt(hasTools, insertMode || "smart_action", documentStructureDescription);
-
-  const retrievalPrompt: ChatMessage = {
-    role: "system",
-    content: contextText
-      ? `以下是可用知识片段：\n${contextText}\n\n请尽可能基于这些片段回答，并标注来源编号。`
-      : "当前没有检索到知识库片段，你可以基于用户输入给出通用建议。",
-  };
+  // Stable system prompt — no dynamic content appended.
+  const systemPrompt = buildSystemPrompt(hasTools, insertMode || "smart_action");
 
   // Sanitize messages: remove orphaned tool_calls that have no matching tool
   // response messages.  This prevents 400 errors from the LLM API when a
@@ -742,9 +753,32 @@ function buildPayload(
   // before tool results could be sent).
   const sanitized = sanitizeMessages(messages);
 
+  // Assemble the trailing dynamic-context system message.
+  // All high-frequency changing content goes here, at the END of the array,
+  // so the stable system prompt + conversation history prefix remains cacheable.
+  const dynamicParts: string[] = [];
+  if (contextText) {
+    dynamicParts.push(`以下是可用知识片段：\n${contextText}\n\n请尽可能基于这些片段回答，并标注来源编号。`);
+  } else {
+    dynamicParts.push("当前没有检索到知识库片段，你可以基于用户输入给出通用建议。");
+  }
+  if (documentStructureDescription) {
+    dynamicParts.push(`当前文档结构：\n${documentStructureDescription}`);
+  }
+  if (dynamicContext?.documentContext) {
+    dynamicParts.push(`文档上下文:\n${dynamicContext.documentContext}`);
+  }
+  if (dynamicContext?.selection) {
+    dynamicParts.push(`当前选区:\n${dynamicContext.selection}`);
+  }
+  const trailingSystem: ChatMessage = {
+    role: "system",
+    content: dynamicParts.join("\n\n"),
+  };
+
   const payload: Record<string, any> = {
     model: config.model,
-    messages: [systemPrompt, retrievalPrompt, ...sanitized],
+    messages: [systemPrompt, ...sanitized, trailingSystem],
     temperature: config.temperature ?? 0.2,
     max_tokens: config.maxTokens ?? 900,
     stream,
@@ -1003,11 +1037,24 @@ export async function callOpenAICompatible(
   contextChunks: RetrievalChunk[],
   tools?: ToolDefinition[],
   insertMode?: string,
-  documentStructureDescription?: string
+  documentStructureDescription?: string,
+  dynamicContext?: { documentContext?: string; selection?: string }
 ): Promise<{ reply: string; actionPlan: ActionPlan | null; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
-  const payload = buildPayload(config, messages, contextChunks, false, tools, insertMode, documentStructureDescription);
+  const payload = buildPayload(config, messages, contextChunks, false, tools, insertMode, documentStructureDescription, dynamicContext);
   const endpoint = getEndpoint(config);
   const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 180_000);
+
+  const traceId = await logRequestStart({
+    endpoint: "callOpenAICompatible",
+    model: config.model,
+    messages: payload.messages,
+    tools: payload.tools,
+    temperature: payload.temperature,
+    maxTokens: payload.max_tokens,
+    stream: false,
+    dynamicContext,
+    retrievedChunks: contextChunks.map((c) => ({ id: c.id, fileName: c.fileName, text: c.text })),
+  });
 
   let response: Response;
   try {
@@ -1028,19 +1075,34 @@ export async function callOpenAICompatible(
         ? (error as { cause?: { code?: string } }).cause?.code
         : undefined;
     const codeSuffix = causeCode ? ` (${causeCode})` : "";
+    await logError(traceId, { endpoint: "callOpenAICompatible", error: `LLM network error: ${message}${codeSuffix}` });
     throw new Error(`LLM network error to ${endpoint}: ${message}${codeSuffix}`);
   }
 
   if (!response.ok) {
     const details = await response.text();
+    await logResponseRaw(traceId, { status: response.status, contentType: response.headers.get("content-type") ?? undefined, bodyPreview: details.slice(0, 2000) });
+    await logError(traceId, { endpoint: "callOpenAICompatible", error: `HTTP ${response.status}: ${details.slice(0, 500)}` });
     throw new LlmHttpError(response.status, details);
   }
 
-  const data = (await response.json()) as ChatCompletionResponse;
+  const contentType = response.headers.get("content-type") || "";
+  const rawText = await response.text();
+  await logResponseRaw(traceId, { status: response.status, contentType, bodyPreview: rawText.slice(0, 4000) });
+
+  let data: ChatCompletionResponse;
+  try {
+    data = JSON.parse(rawText) as ChatCompletionResponse;
+  } catch (parseErr) {
+    await logError(traceId, { endpoint: "callOpenAICompatible", error: `JSON parse failed: ${(parseErr as Error).message}. Raw length=${rawText.length}. First 200 chars: ${rawText.slice(0, 200)}` });
+    throw new Error(`LLM response JSON parse failed: ${(parseErr as Error).message}`);
+  }
+
   const choice = data.choices?.[0];
   const message = choice?.message;
 
   if (!message) {
+    await logResponseParsed(traceId, { reply: "模型没有返回可用内容。", actionPlan: null });
     return { reply: "模型没有返回可用内容。", actionPlan: null };
   }
 
@@ -1049,6 +1111,7 @@ export async function callOpenAICompatible(
     const actionPlan = parseActionPlanFromToolCalls(message.tool_calls);
     // If there's also text content, include it as the reply
     const reply = message.content?.trim() || actionPlan.explanation;
+    await logResponseParsed(traceId, { reply, actionPlan, toolCalls: message.tool_calls });
     return { reply, actionPlan, toolCalls: message.tool_calls };
   }
 
@@ -1057,6 +1120,7 @@ export async function callOpenAICompatible(
   const textActionPlan = parseActionPlanFromText(textContent);
   const reply = textActionPlan ? extractTextReply(textContent) || textActionPlan.explanation : textContent;
 
+  await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
   return { reply, actionPlan: textActionPlan };
 }
 
@@ -1087,12 +1151,25 @@ export async function streamOpenAICompatible(
   signal?: AbortSignal,
   tools?: ToolDefinition[],
   insertMode?: string,
-  documentStructureDescription?: string
+  documentStructureDescription?: string,
+  dynamicContext?: { documentContext?: string; selection?: string }
 ): Promise<{ reply: string; actionPlan: ActionPlan | null; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
-  const payload = buildPayload(config, messages, contextChunks, true, tools, insertMode, documentStructureDescription);
+  const payload = buildPayload(config, messages, contextChunks, true, tools, insertMode, documentStructureDescription, dynamicContext);
   const endpoint = getEndpoint(config);
   const overallTimeoutMs = config.overallTimeout ? config.overallTimeout * 1000 : Number(process.env.LLM_STREAM_TIMEOUT_MS ?? 240_000);
   const firstTokenTimeoutMs = config.firstTokenTimeout ? config.firstTokenTimeout * 1000 : Number(process.env.LLM_STREAM_FIRST_TOKEN_TIMEOUT_MS ?? 20_000);
+
+  const traceId = await logRequestStart({
+    endpoint: "streamOpenAICompatible",
+    model: config.model,
+    messages: payload.messages,
+    tools: payload.tools,
+    temperature: payload.temperature,
+    maxTokens: payload.max_tokens,
+    stream: true,
+    dynamicContext,
+    retrievedChunks: contextChunks.map((c) => ({ id: c.id, fileName: c.fileName, text: c.text })),
+  });
 
   const controller = new AbortController();
   let externalAbortHandler: (() => void) | null = null;
@@ -1137,9 +1214,11 @@ export async function streamOpenAICompatible(
     if (error instanceof Error && controller.signal.aborted) {
       const reason = controller.signal.reason;
       if (reason instanceof Error && reason.message === "stream_first_token_timeout") {
+        await logError(traceId, { endpoint: "streamOpenAICompatible", error: `first token timeout ${firstTokenTimeoutMs}ms` });
         throw new Error(`LLM stream timeout: first token not received within ${firstTokenTimeoutMs}ms`);
       }
       if (reason instanceof Error && reason.message === "stream_overall_timeout") {
+        await logError(traceId, { endpoint: "streamOpenAICompatible", error: `overall timeout ${overallTimeoutMs}ms` });
         throw new Error(`LLM stream timeout: response not finished within ${overallTimeoutMs}ms`);
       }
     }
@@ -1150,6 +1229,7 @@ export async function streamOpenAICompatible(
         ? (error as { cause?: { code?: string } }).cause?.code
         : undefined;
     const codeSuffix = causeCode ? ` (${causeCode})` : "";
+    await logError(traceId, { endpoint: "streamOpenAICompatible", error: `network error: ${message}${codeSuffix}` });
     throw new Error(`LLM network error to ${endpoint}: ${message}${codeSuffix}`);
   }
 
@@ -1160,6 +1240,8 @@ export async function streamOpenAICompatible(
       signal.removeEventListener("abort", externalAbortHandler);
     }
     const details = await response.text();
+    await logResponseRaw(traceId, { status: response.status, contentType: response.headers.get("content-type") ?? undefined, bodyPreview: details.slice(0, 2000) });
+    await logError(traceId, { endpoint: "streamOpenAICompatible", error: `HTTP ${response.status}: ${details.slice(0, 500)}` });
     throw new LlmHttpError(response.status, details);
   }
 
@@ -1171,11 +1253,22 @@ export async function streamOpenAICompatible(
       signal.removeEventListener("abort", externalAbortHandler);
     }
 
-    const data = (await response.json()) as ChatCompletionResponse;
+    const rawText = await response.text();
+    await logResponseRaw(traceId, { status: response.status, contentType, bodyPreview: rawText.slice(0, 4000) });
+
+    let data: ChatCompletionResponse;
+    try {
+      data = JSON.parse(rawText) as ChatCompletionResponse;
+    } catch (parseErr) {
+      await logError(traceId, { endpoint: "streamOpenAICompatible", error: `JSON parse failed (json branch): ${(parseErr as Error).message}. Raw length=${rawText.length}. First 200 chars: ${rawText.slice(0, 200)}` });
+      throw new Error(`LLM response JSON parse failed: ${(parseErr as Error).message}`);
+    }
+
     const choice = data.choices?.[0];
     const message = choice?.message;
 
     if (!message) {
+      await logResponseParsed(traceId, { reply: "模型没有返回可用内容。", actionPlan: null });
       return { reply: "模型没有返回可用内容。", actionPlan: null };
     }
 
@@ -1186,6 +1279,7 @@ export async function streamOpenAICompatible(
       if (reply) {
         onDelta(reply);
       }
+      await logResponseParsed(traceId, { reply, actionPlan, toolCalls: message.tool_calls });
       return { reply, actionPlan, toolCalls: message.tool_calls };
     }
 
@@ -1195,6 +1289,7 @@ export async function streamOpenAICompatible(
     if (textContent) {
       onDelta(textContent);
     }
+    await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
     return { reply, actionPlan: textActionPlan };
   }
 
@@ -1300,6 +1395,8 @@ export async function streamOpenAICompatible(
     signal.removeEventListener("abort", externalAbortHandler);
   }
 
+  await logResponseRaw(traceId, { status: response.status, contentType, streamChunkCount: pendingToolCalls.size });
+
   // Process accumulated tool calls
   if (pendingToolCalls.size > 0) {
     const toolCalls = [...pendingToolCalls.entries()]
@@ -1315,11 +1412,13 @@ export async function streamOpenAICompatible(
 
     const actionPlan = parseActionPlanFromToolCalls(toolCalls);
     const reply = fullText.trim() || actionPlan.explanation;
+    await logResponseParsed(traceId, { reply, actionPlan, toolCalls });
     return { reply, actionPlan, toolCalls };
   }
 
   // No tool calls — check for text-based action plan
   const textActionPlan = parseActionPlanFromText(fullText);
   const reply = textActionPlan ? extractTextReply(fullText) || textActionPlan.explanation : fullText.trim() || "模型没有返回可用内容。";
+  await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
   return { reply, actionPlan: textActionPlan };
 }

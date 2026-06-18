@@ -218,6 +218,17 @@ button:disabled {
   grid-template-columns: 1fr 1fr;
 }
 
+#presetNameRow {
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+}
+
+#presetNameRow input[type="text"] {
+  min-width: 0;
+  font-size: 13px;
+  padding: 4px 6px;
+}
+
 .chatlog {
   border: 1px solid var(--line);
   border-radius: 6px;

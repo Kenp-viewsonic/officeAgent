@@ -41,6 +41,11 @@
             <button id="savePreset" class="secondary" type="button">保存为方案</button>
             <button id="deletePreset" class="secondary danger" type="button">删除方案</button>
           </div>
+          <div id="presetNameRow" class="row actions" style="display:none;">
+            <input id="presetNameInput" type="text" placeholder="输入方案名称，如 DeepSeek" />
+            <button id="presetNameConfirm" class="secondary" type="button">确认</button>
+            <button id="presetNameCancel" class="secondary" type="button">取消</button>
+          </div>
           <label>Base URL <input id="baseUrl" placeholder="https://api.openai.com/v1" /></label>
           <label>API Key <input id="apiKey" type="password" placeholder="sk-..." /></label>
           <label>Model

@@ -9,6 +9,27 @@ import { callOpenAICompatible, describeDocumentStructure, isPerceptionOnlyPlan, 
 import { keywordRetrieve, splitToChunks } from "./retrieval.js";
 import { appendChunks, clearAllChunks, deleteChunksByFile, getKbFileList, getKbStats, importChunks, loadChunks, loadProviderConfig, saveProviderConfig, loadPresets, savePreset, deletePreset } from "./store.js";
 import { ActionPlan, ChatMessage, DocumentStructure, ProviderConfig, ConfigPreset, RetrievalChunk } from "./types.js";
+import { logHttpRequest, logToolCall, logToolResult, logIterationEnd, logError } from "./agent-logger.js";
+
+/**
+ * Safely parse a tool_call arguments string.
+ *
+ * DeepSeek (especially deepseek-v4-flash) occasionally returns malformed
+ * arguments JSON — e.g. internal tokens like `<｜｜DSML｜｜` leaking into the
+ * output, or truncated streaming fragments.  A bare JSON.parse in that case
+ * throws and crashes the entire SSE response ("Unexpected end of JSON input"
+ * on the client).  This helper never throws: on parse failure it returns
+ * `{ raw_arguments: <original string> }` so the tool call can still be
+ * surfaced to the user / logged for debugging.
+ */
+function safeParseToolArgs(raw: string | undefined | null): Record<string, any> {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as Record<string, any>;
+  } catch {
+    return { raw_arguments: raw };
+  }
+}
 
 const app = express();
 const upload = multer({ limits: { fileSize: Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024 } });
@@ -349,13 +370,19 @@ async function buildChatContext(payload: z.infer<typeof chatSchema>) {
     documentStructureDescription = describeDocumentStructure(payload.documentStructure);
   }
 
-  const enrichedMessages: ChatMessage[] = contextParts.length
-    ? [{ role: "system", content: contextParts.join("\n\n") }, ...messages]
-    : messages;
+  // NOTE: documentContext / selection are NOT injected as a leading system
+  // message anymore. They are passed through as `dynamicContext` and appended
+  // as a TRAILING system message inside buildPayload(), so the stable system
+  // prompt + conversation history prefix stays cacheable.
+  const dynamicContext: { documentContext?: string; selection?: string } = {};
+  if (payload.documentContext) dynamicContext.documentContext = payload.documentContext;
+  if (payload.selection) dynamicContext.selection = payload.selection;
+
+  const enrichedMessages: ChatMessage[] = messages;
 
   const insertMode = payload.insertMode || "smart_action";
 
-  return { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode };
+  return { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode, dynamicContext };
 }
 
 // --- Non-streaming chat endpoint ---
@@ -371,14 +398,15 @@ app.post("/v1/chat", async (req, res) => {
   }
 
   try {
-    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode } = await buildChatContext(parsed.data);
+    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode, dynamicContext } = await buildChatContext(parsed.data);
     const result = await callOpenAICompatible(
       provider,
       enrichedMessages,
       retrieved,
       WORD_TOOLS,
       insertMode,
-      documentStructureDescription
+      documentStructureDescription,
+      dynamicContext
     );
     return res.json({
       ok: true,
@@ -422,7 +450,7 @@ app.post("/v1/chat/stream", async (req, res) => {
   });
 
   try {
-    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode } = await buildChatContext(parsed.data);
+    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode, dynamicContext } = await buildChatContext(parsed.data);
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -444,7 +472,8 @@ app.post("/v1/chat/stream", async (req, res) => {
         abortController.signal,
         WORD_TOOLS,
         insertMode,
-        documentStructureDescription
+        documentStructureDescription,
+        dynamicContext
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -456,7 +485,7 @@ app.post("/v1/chat/stream", async (req, res) => {
 
       // Some OpenAI-compatible providers accept stream=true but don't emit SSE chunks.
       // Fall back to non-stream completion so client can still receive a final answer.
-      result = await callOpenAICompatible(provider, enrichedMessages, retrieved, WORD_TOOLS, insertMode, documentStructureDescription);
+      result = await callOpenAICompatible(provider, enrichedMessages, retrieved, WORD_TOOLS, insertMode, documentStructureDescription, dynamicContext);
       res.write(`data: ${JSON.stringify({ type: "fallback", reason: "no_stream_delta" })}\n\n`);
     }
 
@@ -506,6 +535,7 @@ async function runAgentIteration(
   retrieved: RetrievalChunk[],
   insertMode: string,
   documentStructureDescription: string | undefined,
+  dynamicContext: { documentContext?: string; selection?: string } | undefined,
   onEvent: (event: any) => void,
   signal: AbortSignal,
   iteration: number
@@ -520,43 +550,53 @@ async function runAgentIteration(
     signal,
     WORD_TOOLS,
     insertMode,
-    documentStructureDescription
+    documentStructureDescription,
+    dynamicContext
   );
 
   // If LLM returned tool calls
   if (result.toolCalls && result.toolCalls.length > 0) {
     const actionPlan = parseActionPlanFromToolCalls(result.toolCalls);
 
+    // Log each tool call issued
+    for (const tc of result.toolCalls) {
+      const params = safeParseToolArgs(tc.function.arguments);
+      await logToolCall(undefined, { iteration, toolCallId: tc.id, toolName: tc.function.name, params });
+    }
+
     // Check if task_complete is called — stop the loop
     const taskCompleteCall = result.toolCalls.find((tc) => tc.function.name === "task_complete");
     if (taskCompleteCall) {
       let summary = "任务已完成";
-      try {
-        const args = JSON.parse(taskCompleteCall.function.arguments || "{}");
-        summary = args.summary || summary;
-      } catch { /* ignore */ }
+      const taskArgs = safeParseToolArgs(taskCompleteCall.function.arguments);
+      summary = taskArgs.summary || summary;
       onEvent({ type: "task_complete", summary });
+      await logIterationEnd("", { iteration, done: true, reason: `task_complete: ${summary}` });
       return { reply: summary, actionPlan: null, done: true, toolCalls: result.toolCalls };
     }
 
     // Check if all tool calls are perception-only
     if (isPerceptionOnlyPlan(actionPlan)) {
-      onEvent({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) });
+      onEvent({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
+      await logIterationEnd("", { iteration, done: false, reason: "perception_only_plan" });
       return { reply: result.reply, actionPlan, done: false, toolCalls: result.toolCalls };
     }
 
     // Check if tool calls are iterable (perception + safe action tools) - continue loop
     if (isIterablePlan(actionPlan)) {
-      onEvent({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) });
+      onEvent({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
+      await logIterationEnd("", { iteration, done: false, reason: "iterable_plan" });
       return { reply: result.reply, actionPlan, done: false, toolCalls: result.toolCalls };
     }
 
     // Mixed or action-only: send action_plan event and finish
     onEvent({ type: "action_plan", plan: actionPlan });
+    await logIterationEnd("", { iteration, done: true, reason: "action_plan" });
     return { reply: result.reply, actionPlan, done: true, toolCalls: result.toolCalls };
   }
 
   // No tool calls — final reply
+  await logIterationEnd("", { iteration, done: true, reason: "final_reply" });
   return { reply: result.reply, actionPlan: result.actionPlan, done: true };
 }
 
@@ -575,8 +615,20 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
   });
 
   try {
-    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode } = await buildChatContext(parsed.data);
+    const { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode, dynamicContext } = await buildChatContext(parsed.data);
     const maxIterations = parsed.data.maxIterations ?? 10;
+
+    const httpTraceId = await logHttpRequest("/v1/chat/agent-stream", {
+      method: "POST",
+      body: {
+        messageCount: parsed.data.messages?.length ?? 0,
+        hasDocumentContext: !!parsed.data.documentContext,
+        hasDocumentStructure: !!parsed.data.documentStructure,
+        hasSelection: !!parsed.data.selection,
+        insertMode: parsed.data.insertMode,
+        maxIterations,
+      },
+    });
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -592,6 +644,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
     if (createdSession) {
       createdSession.documentStructureDescription = documentStructureDescription;
       createdSession.insertMode = insertMode;
+      createdSession.dynamicContext = dynamicContext;
     }
     res.write(`data: ${JSON.stringify({ type: "session", sessionId })}
 \n`);
@@ -612,6 +665,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
           retrieved,
           insertMode,
           documentStructureDescription,
+          dynamicContext,
           (event) => res.write(`data: ${JSON.stringify(event)}
 \n`),
           abortController.signal,
@@ -632,16 +686,17 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
           retrieved,
           WORD_TOOLS,
           insertMode,
-          documentStructureDescription
+          documentStructureDescription,
+          dynamicContext
         );
 
         if (fallbackResult.toolCalls && fallbackResult.toolCalls.length > 0) {
           const actionPlan = parseActionPlanFromToolCalls(fallbackResult.toolCalls);
           if (isPerceptionOnlyPlan(actionPlan)) {
-            res.write(`data: ${JSON.stringify({ type: "tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}
+            res.write(`data: ${JSON.stringify({ type: "tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}
 \n`);
             iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };          } else if (isIterablePlan(actionPlan)) {
-            res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}
+            res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}
 \n`);
             iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };          } else {
             res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}
@@ -721,8 +776,13 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
     return res.end();
   } catch (error) {
     if (abortController.signal.aborted) {
+      await logError(undefined, { endpoint: "/v1/chat/agent-stream", error: "client aborted" });
       return;
     }
+
+    const errMsg = error instanceof Error ? error.message : "Unknown error";
+    const errStack = error instanceof Error ? error.stack : undefined;
+    await logError(undefined, { endpoint: "/v1/chat/agent-stream", error: errMsg, stack: errStack });
 
     if (!res.headersSent) {
       if (error instanceof Error && error.message.startsWith("Provider config missing")) {
@@ -771,12 +831,35 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
   try {
     const session = getSession(parsed.data.sessionId);
     if (!session) {
+      await logError(undefined, { endpoint: "/v1/chat/agent-continue", error: `Session not found: ${parsed.data.sessionId}` });
       return res.status(404).json({ error: "Session not found or expired" });
+    }
+
+    await logHttpRequest("/v1/chat/agent-continue", {
+      method: "POST",
+      sessionId: parsed.data.sessionId,
+      body: {
+        toolResultCount: parsed.data.toolResults?.length ?? 0,
+        toolResults: parsed.data.toolResults?.map((tr) => ({ toolCallId: tr.toolCallId, toolName: tr.toolName, success: tr.success, resultLength: tr.result?.length ?? 0 })),
+        hasDocumentStructure: !!parsed.data.documentStructure,
+      },
+    });
+
+    // Log each tool result
+    for (const tr of parsed.data.toolResults) {
+      await logToolResult(undefined, {
+        sessionId: parsed.data.sessionId,
+        toolCallId: tr.toolCallId,
+        toolName: tr.toolName,
+        result: tr.result,
+        success: tr.success,
+      });
     }
 
     // Use fresh document structure from request if provided, otherwise fall back to session-cached context
     let documentStructureDescription = session.documentStructureDescription;
     let insertMode = session.insertMode || "smart_action";
+    let dynamicContext = session.dynamicContext || {};
 
     if (parsed.data.documentStructure) {
       documentStructureDescription = describeDocumentStructure(parsed.data.documentStructure);
@@ -844,7 +927,8 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
         abortController.signal,
         WORD_TOOLS,
         insertMode,
-        documentStructureDescription
+        documentStructureDescription,
+        dynamicContext
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -860,7 +944,8 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
         retrieved,
         WORD_TOOLS,
         insertMode,
-        documentStructureDescription
+        documentStructureDescription,
+        dynamicContext
       );
       res.write(`data: ${JSON.stringify({ type: "fallback", reason: "no_stream_delta" })}
 \n`);
@@ -904,17 +989,15 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       const taskCompleteCall = result.toolCalls.find((tc) => tc.function.name === "task_complete");
       if (taskCompleteCall) {
         let summary = "任务已完成";
-        try {
-          const args = JSON.parse(taskCompleteCall.function.arguments || "{}");
-          summary = args.summary || summary;
-        } catch { /* ignore */ }
+        const taskArgs = safeParseToolArgs(taskCompleteCall.function.arguments);
+        summary = taskArgs.summary || summary;
         res.write(`data: ${JSON.stringify({ type: "task_complete", summary })}\n\n`);
       } else {
         const actionPlan = parseActionPlanFromToolCalls(result.toolCalls);
         if (isPerceptionOnlyPlan(actionPlan)) {
-          res.write(`data: ${JSON.stringify({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}\n\n`);
         } else if (isIterablePlan(actionPlan)) {
-          res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: JSON.parse(tc.function.arguments || "{}") })) })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}\n\n`);
         } else {
           res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}\n\n`);
         }
@@ -933,8 +1016,13 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     return res.end();
   } catch (error) {
     if (abortController.signal.aborted) {
+      await logError(undefined, { endpoint: "/v1/chat/agent-continue", error: "client aborted" });
       return;
     }
+
+    const errMsg = error instanceof Error ? error.message : "Unknown error";
+    const errStack = error instanceof Error ? error.stack : undefined;
+    await logError(undefined, { endpoint: "/v1/chat/agent-continue", error: errMsg, stack: errStack });
 
     if (!res.headersSent) {
       if (error instanceof Error && error.message.startsWith("Provider config missing")) {
@@ -960,12 +1048,7 @@ function parseActionPlanFromToolCalls(
   toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>
 ): ActionPlan {
   const actions = toolCalls.map((tc) => {
-    let params: Record<string, any> = {};
-    try {
-      params = JSON.parse(tc.function.arguments);
-    } catch {
-      params = { raw_arguments: tc.function.arguments };
-    }
+    const params = safeParseToolArgs(tc.function.arguments);
     return {
       action: tc.function.name,
       params,

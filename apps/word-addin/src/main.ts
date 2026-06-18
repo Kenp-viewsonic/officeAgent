@@ -972,9 +972,9 @@ async function saveProviderConfig(): Promise<void> {
   try {
     setStatus(configStatus, "保存中...");
 
-    const body = {
+    const apiKeyRaw = $<HTMLInputElement>("apiKey").value.trim();
+    const body: Record<string, any> = {
       baseUrl: $<HTMLInputElement>("baseUrl").value.trim(),
-      apiKey: $<HTMLInputElement>("apiKey").value.trim(),
       model: $<HTMLInputElement>("model").value.trim(),
       temperature: Number($<HTMLInputElement>("temperature").value || "0.2"),
       maxTokens: Number($<HTMLInputElement>("maxTokens").value || "900"),
@@ -982,9 +982,9 @@ async function saveProviderConfig(): Promise<void> {
       overallTimeout: Number($<HTMLInputElement>("overallTimeout").value || "240"),
     };
 
-    if (!body.apiKey) {
-      setStatus(configStatus, "请填写 API Key（当前版本保存配置时为必填）");
-      return;
+    // 只在用户实际输入了 apiKey 时才发送，否则由后端保留已保存的 key
+    if (apiKeyRaw) {
+      body.apiKey = apiKeyRaw;
     }
 
     const res = await fetch(`${agentBase}/v1/provider/config`, {
@@ -999,7 +999,7 @@ async function saveProviderConfig(): Promise<void> {
       return;
     }
 
-    setStatus(configStatus, "保存成功（本地存储）");
+    setStatus(configStatus, apiKeyRaw ? "保存成功" : "保存成功（API Key 已保留）");
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
     setStatus(configStatus, `保存失败: 无法连接本地 Agent (${message})`);
@@ -1020,7 +1020,10 @@ async function loadPresets(): Promise<void> {
   const select = $<HTMLSelectElement>("presetSelect");
   try {
     const res = await fetch(`${agentBase}/v1/presets`);
-    if (!res.ok) return;
+    if (!res.ok) {
+      setStatus(configStatus, "加载配置方案列表失败");
+      return;
+    }
     const data = (await res.json()) as { ok: boolean; presets: PresetView[] };
     const presets = data.presets ?? [];
 
@@ -1037,16 +1040,18 @@ async function loadPresets(): Promise<void> {
       select.value = current;
     }
   } catch {
-    // Silent fail
+    setStatus(configStatus, "加载配置方案列表失败（本地 Agent 不可达）");
   }
 }
 
 async function loadPresetById(id: string): Promise<void> {
   if (!id) return;
   try {
+    setStatus(configStatus, "正在加载方案...");
     const res = await fetch(`${agentBase}/v1/presets/${id}/activate`, { method: "POST" });
     if (!res.ok) {
-      setStatus(configStatus, "加载方案失败");
+      const err = await parseErrorMessage(res);
+      setStatus(configStatus, `加载方案失败: ${err}`);
       return;
     }
     await loadProviderConfig();
@@ -1057,34 +1062,95 @@ async function loadPresetById(id: string): Promise<void> {
   }
 }
 
+function showPresetNameInput(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const row = $("presetNameRow") as HTMLDivElement;
+    const input = $<HTMLInputElement>("presetNameInput");
+    const confirmBtn = $("presetNameConfirm") as HTMLButtonElement;
+    const cancelBtn = $("presetNameCancel") as HTMLButtonElement;
+
+    input.value = "";
+    row.style.display = "";
+    input.focus();
+
+    function cleanup() {
+      row.style.display = "none";
+      input.removeEventListener("keydown", onKeydown);
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+    }
+
+    function onConfirm() {
+      const val = input.value.trim();
+      if (!val) {
+        input.style.borderColor = "red";
+        input.placeholder = "名称不能为空，请输入方案名称";
+        input.focus();
+        return;
+      }
+      cleanup();
+      resolve(val);
+    }
+
+    function onCancel() {
+      cleanup();
+      resolve(null);
+    }
+
+    function onKeydown(e: KeyboardEvent) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        onConfirm();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        onCancel();
+      }
+      // Clear error styling on input
+      input.style.borderColor = "";
+      input.placeholder = "输入方案名称，如 DeepSeek";
+    }
+
+    input.addEventListener("keydown", onKeydown);
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+  });
+}
+
 async function saveCurrentAsPreset(): Promise<void> {
-  const name = prompt("请输入配置方案名称：");
-  if (!name) return;
-
-  const apiKey = $<HTMLInputElement>("apiKey").value.trim();
-
-  const preset = {
-    id: `preset_${Date.now()}`,
-    name,
-    config: {
-      baseUrl: $<HTMLInputElement>("baseUrl").value.trim(),
-      ...(apiKey ? { apiKey } : {}),
-      model: $<HTMLInputElement>("model").value.trim(),
-      temperature: Number($<HTMLInputElement>("temperature").value || "0.2"),
-      maxTokens: Number($<HTMLInputElement>("maxTokens").value || "900"),
-      firstTokenTimeout: Number($<HTMLInputElement>("firstTokenTimeout").value || "20"),
-      overallTimeout: Number($<HTMLInputElement>("overallTimeout").value || "240"),
-    },
-  };
-
   try {
+    // Show inline name input (prompt() is unreliable in Office Add-in iframes)
+    const name = await showPresetNameInput();
+    if (!name) return;
+
+    const apiKey = $<HTMLInputElement>("apiKey").value.trim();
+    if (!apiKey) {
+      setStatus(configStatus, "请先填写 API Key，方案需要包含完整的 API 凭据");
+      return;
+    }
+
+    setStatus(configStatus, "正在保存方案...");
+    const preset = {
+      id: `preset_${Date.now()}`,
+      name,
+      config: {
+        baseUrl: $<HTMLInputElement>("baseUrl").value.trim(),
+        apiKey,
+        model: $<HTMLInputElement>("model").value.trim(),
+        temperature: Number($<HTMLInputElement>("temperature").value || "0.2"),
+        maxTokens: Number($<HTMLInputElement>("maxTokens").value || "900"),
+        firstTokenTimeout: Number($<HTMLInputElement>("firstTokenTimeout").value || "20"),
+        overallTimeout: Number($<HTMLInputElement>("overallTimeout").value || "240"),
+      },
+    };
+
     const res = await fetch(`${agentBase}/v1/presets`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(preset),
     });
     if (!res.ok) {
-      setStatus(configStatus, "保存方案失败");
+      const err = await parseErrorMessage(res);
+      setStatus(configStatus, `保存方案失败: ${err}`);
       return;
     }
     await loadPresets();
@@ -1109,7 +1175,8 @@ async function deleteSelectedPreset(): Promise<void> {
   try {
     const res = await fetch(`${agentBase}/v1/presets/${id}`, { method: "DELETE" });
     if (!res.ok) {
-      setStatus(configStatus, "删除方案失败");
+      const err = await parseErrorMessage(res);
+      setStatus(configStatus, `删除方案失败: ${err}`);
       return;
     }
     select.value = "";

@@ -110,6 +110,8 @@ export type AgentSession = {
   documentStructureDescription?: string;
   /** Cached insert mode for agent-continue */
   insertMode?: string;
+  /** Cached dynamic context (documentContext / selection) for agent-continue */
+  dynamicContext?: { documentContext?: string; selection?: string };
 };
 
 // --- Tool Definitions (OpenAI Function Calling format) ---
