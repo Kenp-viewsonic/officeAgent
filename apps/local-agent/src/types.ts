@@ -6,6 +6,16 @@ export type ProviderConfig = {
   maxTokens?: number;
   firstTokenTimeout?: number;
   overallTimeout?: number;
+  /** Enable thinking / reasoning mode (DeepSeek, Agnes, etc.) */
+  enableThinking?: boolean;
+  /** Whether to include reasoning_content when sending history back to the API.
+   *  Defaults to true because tool-call rounds always require it. */
+  includeReasoningContent?: boolean;
+  /** Thinking effort level. "medium" and "high" map sensibly across providers. */
+  thinkingEffort?: "medium" | "high";
+  /** Parameter format: "deepseek" uses `thinking` + `reasoning_effort`;
+   *  "openai" uses `chat_template_kwargs.enable_thinking`. */
+  thinkingFormat?: "deepseek" | "openai";
 };
 
 export type ConfigPreset = {
@@ -21,6 +31,9 @@ export type ChatMessage = {
   content: string;
   tool_call_id?: string;
   name?: string;
+  /** Reasoning / thinking chain content (DeepSeek, Agnes, etc.).
+   *  Required for tool-call rounds in DeepSeek; optional otherwise. */
+  reasoning_content?: string;
   tool_calls?: Array<{
     id: string;
     type: "function";

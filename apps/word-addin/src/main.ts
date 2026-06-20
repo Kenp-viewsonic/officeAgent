@@ -244,6 +244,10 @@ type ProviderConfigView = {
   firstTokenTimeout?: number;
   overallTimeout?: number;
   hasApiKey: boolean;
+  enableThinking?: boolean;
+  includeReasoningContent?: boolean;
+  thinkingEffort?: "medium" | "high";
+  thinkingFormat?: "deepseek" | "openai";
 };
 
 function setStatus(target: HTMLParagraphElement, text: string): void {
@@ -917,6 +921,14 @@ async function loadProviderConfig(): Promise<void> {
     apiKeyInput.value = "";
     apiKeyInput.placeholder = data.hasApiKey ? "已保存（留空表示不修改）" : "sk-...";
 
+    // Thinking / reasoning options
+    const enableThinking = data.enableThinking ?? false;
+    $<HTMLInputElement>("enableThinking").checked = enableThinking;
+    $<HTMLInputElement>("includeReasoningContent").checked = data.includeReasoningContent ?? true;
+    $<HTMLSelectElement>("thinkingEffort").value = data.thinkingEffort ?? "high";
+    $<HTMLSelectElement>("thinkingFormat").value = data.thinkingFormat ?? "deepseek";
+    updateThinkingOptionsVisibility(enableThinking);
+
     setStatus(configStatus, data.hasApiKey ? "已加载已保存配置" : "已加载配置（尚未保存 API Key）");
 
     // 加载配置后自动刷新模型列表
@@ -935,7 +947,17 @@ async function refreshModelList(): Promise<void> {
   setStatus(configStatus, "正在获取模型列表...");
 
   try {
-    const res = await fetch(`${agentBase}/v1/provider/models`, { method: "GET" });
+    // Build query string from input fields so backend can fall back
+    // to these values when no saved config exists.
+    const params = new URLSearchParams();
+    const inputBaseUrl = $<HTMLInputElement>("baseUrl").value.trim();
+    const inputApiKey = $<HTMLInputElement>("apiKey").value.trim();
+    if (inputBaseUrl) params.set("baseUrl", inputBaseUrl);
+    if (inputApiKey) params.set("apiKey", inputApiKey);
+    const qs = params.toString();
+    const url = `${agentBase}/v1/provider/models${qs ? "?" + qs : ""}`;
+
+    const res = await fetch(url, { method: "GET" });
 
     if (!res.ok) {
       const err = await parseErrorMessage(res);
@@ -968,6 +990,11 @@ async function refreshModelList(): Promise<void> {
   }
 }
 
+function updateThinkingOptionsVisibility(visible: boolean): void {
+  const div = $("thinkingOptions") as HTMLDivElement;
+  div.style.display = visible ? "" : "none";
+}
+
 async function saveProviderConfig(): Promise<void> {
   try {
     setStatus(configStatus, "保存中...");
@@ -980,6 +1007,10 @@ async function saveProviderConfig(): Promise<void> {
       maxTokens: Number($<HTMLInputElement>("maxTokens").value || "900"),
       firstTokenTimeout: Number($<HTMLInputElement>("firstTokenTimeout").value || "20"),
       overallTimeout: Number($<HTMLInputElement>("overallTimeout").value || "240"),
+      enableThinking: $<HTMLInputElement>("enableThinking").checked,
+      includeReasoningContent: $<HTMLInputElement>("includeReasoningContent").checked,
+      thinkingEffort: $<HTMLSelectElement>("thinkingEffort").value,
+      thinkingFormat: $<HTMLSelectElement>("thinkingFormat").value,
     };
 
     // 只在用户实际输入了 apiKey 时才发送，否则由后端保留已保存的 key
@@ -3188,6 +3219,11 @@ function bindActions(): void {
 
   $("refreshModels").addEventListener("click", () => {
     void refreshModelList();
+  });
+
+  // Thinking mode: toggle sub-options visibility
+  $("enableThinking").addEventListener("change", () => {
+    updateThinkingOptionsVisibility($<HTMLInputElement>("enableThinking").checked);
   });
 
   // Config presets

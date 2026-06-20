@@ -63,6 +63,32 @@
             <label>首次响应超时(秒) <input id="firstTokenTimeout" type="number" min="5" max="120" step="1" value="20" /></label>
             <label>整体超时(秒) <input id="overallTimeout" type="number" min="30" max="600" step="10" value="240" /></label>
           </div>
+          <label class="checkbox-label">
+            <input id="enableThinking" type="checkbox" />
+            开启思考模式（Thinking / Reasoning）
+          </label>
+          <p class="status" style="color:var(--muted); margin-top:-0.3rem;">DeepSeek、Agnes 等模型支持先思考再回答，提升代码质量和任务拆解能力。</p>
+          <div id="thinkingOptions" style="display:none; margin-left:0.5rem; border-left:2px solid var(--primary); padding-left:0.8rem;">
+            <label class="checkbox-label">
+              <input id="includeReasoningContent" type="checkbox" checked />
+              回传思维链内容（Include reasoning_content）
+            </label>
+            <p class="status" style="color:var(--muted); margin-top:-0.3rem;">工具调用轮次会始终回传（DeepSeek 要求）。关闭此选项仅跳过普通对话轮次的思维链。</p>
+            <div class="row">
+              <label>思考强度
+                <select id="thinkingEffort">
+                  <option value="high" selected>high（推荐）</option>
+                  <option value="medium">medium</option>
+                </select>
+              </label>
+              <label>参数格式
+                <select id="thinkingFormat">
+                  <option value="deepseek" selected>DeepSeek 格式</option>
+                  <option value="openai">OpenAI 兼容格式</option>
+                </select>
+              </label>
+            </div>
+          </div>
           <button id="saveConfig">保存配置</button>
           <p id="configStatus" class="status"></p>
         </section>

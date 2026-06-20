@@ -5,6 +5,7 @@ type ChatCompletionResponse = {
   choices?: Array<{
     message?: {
       content?: string;
+      reasoning_content?: string;
       tool_calls?: Array<{
         id: string;
         type: "function";
@@ -18,7 +19,7 @@ type ChatCompletionResponse = {
 };
 
 type StreamChunk = {
-  choices?: Array<{ delta?: { content?: string; tool_calls?: any }; text?: string; message?: { content?: string } }>;
+  choices?: Array<{ delta?: { content?: string; reasoning_content?: string; tool_calls?: any }; text?: string; message?: { content?: string } }>;
 };
 
 type ModelsResponse = {
@@ -789,6 +790,19 @@ function buildPayload(
     payload.tool_choice = "auto";
   }
 
+  // ── Thinking / reasoning mode ──────────────────────────────────────────
+  if (config.enableThinking) {
+    const fmt = config.thinkingFormat ?? "deepseek";
+    if (fmt === "deepseek") {
+      // DeepSeek: thinking passed via extra_body (top-level JSON field)
+      payload.thinking = { type: "enabled" };
+      payload.reasoning_effort = config.thinkingEffort ?? "high";
+    } else {
+      // OpenAI-compatible / Agnes: chat_template_kwargs.enable_thinking
+      payload.chat_template_kwargs = { enable_thinking: true };
+    }
+  }
+
   return payload;
 }
 
@@ -851,8 +865,8 @@ function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
         // All tool_calls are valid — keep as-is
         result.push(msg);
       } else {
-        // Orphaned tool_calls — strip them, keep text only
-        result.push({ role: "assistant", content: msg.content || "" });
+        // Orphaned tool_calls — strip them, keep text and reasoning only
+        result.push({ role: "assistant", content: msg.content || "", reasoning_content: msg.reasoning_content });
       }
     } else if (msg.role === "tool" && msg.tool_call_id) {
       if (validToolCallIds.has(msg.tool_call_id) && !seenToolCallIds.has(msg.tool_call_id)) {
@@ -1039,7 +1053,7 @@ export async function callOpenAICompatible(
   insertMode?: string,
   documentStructureDescription?: string,
   dynamicContext?: { documentContext?: string; selection?: string }
-): Promise<{ reply: string; actionPlan: ActionPlan | null; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
+): Promise<{ reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
   const payload = buildPayload(config, messages, contextChunks, false, tools, insertMode, documentStructureDescription, dynamicContext);
   const endpoint = getEndpoint(config);
   const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 180_000);
@@ -1106,13 +1120,15 @@ export async function callOpenAICompatible(
     return { reply: "模型没有返回可用内容。", actionPlan: null };
   }
 
+  const reasoningContent = message.reasoning_content || undefined;
+
   // Check for tool_calls
   if (message.tool_calls && message.tool_calls.length > 0) {
     const actionPlan = parseActionPlanFromToolCalls(message.tool_calls);
     // If there's also text content, include it as the reply
     const reply = message.content?.trim() || actionPlan.explanation;
     await logResponseParsed(traceId, { reply, actionPlan, toolCalls: message.tool_calls });
-    return { reply, actionPlan, toolCalls: message.tool_calls };
+    return { reply, actionPlan, reasoningContent, toolCalls: message.tool_calls };
   }
 
   // No tool_calls — check for text-based action plan (fallback)
@@ -1121,7 +1137,7 @@ export async function callOpenAICompatible(
   const reply = textActionPlan ? extractTextReply(textContent) || textActionPlan.explanation : textContent;
 
   await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
-  return { reply, actionPlan: textActionPlan };
+  return { reply, actionPlan: textActionPlan, reasoningContent };
 }
 
 // Helper to check if an action plan contains only perception tools
@@ -1153,7 +1169,7 @@ export async function streamOpenAICompatible(
   insertMode?: string,
   documentStructureDescription?: string,
   dynamicContext?: { documentContext?: string; selection?: string }
-): Promise<{ reply: string; actionPlan: ActionPlan | null; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
+): Promise<{ reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
   const payload = buildPayload(config, messages, contextChunks, true, tools, insertMode, documentStructureDescription, dynamicContext);
   const endpoint = getEndpoint(config);
   const overallTimeoutMs = config.overallTimeout ? config.overallTimeout * 1000 : Number(process.env.LLM_STREAM_TIMEOUT_MS ?? 240_000);
@@ -1272,6 +1288,8 @@ export async function streamOpenAICompatible(
       return { reply: "模型没有返回可用内容。", actionPlan: null };
     }
 
+    const reasoningContent = message.reasoning_content || undefined;
+
     // Check for tool_calls in non-streaming JSON response
     if (message.tool_calls && message.tool_calls.length > 0) {
       const actionPlan = parseActionPlanFromToolCalls(message.tool_calls);
@@ -1280,7 +1298,7 @@ export async function streamOpenAICompatible(
         onDelta(reply);
       }
       await logResponseParsed(traceId, { reply, actionPlan, toolCalls: message.tool_calls });
-      return { reply, actionPlan, toolCalls: message.tool_calls };
+      return { reply, actionPlan, reasoningContent, toolCalls: message.tool_calls };
     }
 
     const textContent = message.content?.trim() || "模型没有返回可用内容。";
@@ -1290,7 +1308,7 @@ export async function streamOpenAICompatible(
       onDelta(textContent);
     }
     await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
-    return { reply, actionPlan: textActionPlan };
+    return { reply, actionPlan: textActionPlan, reasoningContent };
   }
 
   if (!response.body) {
@@ -1306,6 +1324,7 @@ export async function streamOpenAICompatible(
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let fullText = "";
+  let fullReasoning = "";
   let pendingToolCalls: Map<number, { id: string; name: string; arguments: string }> = new Map();
 
   while (true) {
@@ -1376,6 +1395,12 @@ export async function streamOpenAICompatible(
         continue;
       }
 
+      // Handle reasoning content (thinking chain in streaming mode)
+      const reasoning = delta.reasoning_content ?? "";
+      if (reasoning) {
+        fullReasoning += reasoning;
+      }
+
       // Handle text content
       const content = delta.content ?? "";
       if (content) {
@@ -1413,12 +1438,12 @@ export async function streamOpenAICompatible(
     const actionPlan = parseActionPlanFromToolCalls(toolCalls);
     const reply = fullText.trim() || actionPlan.explanation;
     await logResponseParsed(traceId, { reply, actionPlan, toolCalls });
-    return { reply, actionPlan, toolCalls };
+    return { reply, actionPlan, reasoningContent: fullReasoning || undefined, toolCalls };
   }
 
   // No tool calls — check for text-based action plan
   const textActionPlan = parseActionPlanFromText(fullText);
   const reply = textActionPlan ? extractTextReply(fullText) || textActionPlan.explanation : fullText.trim() || "模型没有返回可用内容。";
   await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
-  return { reply, actionPlan: textActionPlan };
+  return { reply, actionPlan: textActionPlan, reasoningContent: fullReasoning || undefined };
 }

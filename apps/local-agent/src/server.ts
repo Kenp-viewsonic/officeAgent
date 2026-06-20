@@ -100,6 +100,10 @@ const configSchema = z.object({
   maxTokens: z.number().int().positive().optional(),
   firstTokenTimeout: z.number().int().min(5).max(120).optional(),
   overallTimeout: z.number().int().min(30).max(600).optional(),
+  enableThinking: z.boolean().optional(),
+  includeReasoningContent: z.boolean().optional(),
+  thinkingEffort: z.enum(["medium", "high"]).optional(),
+  thinkingFormat: z.enum(["deepseek", "openai"]).optional(),
 });
 
 app.post("/v1/provider/config", async (req, res) => {
@@ -114,7 +118,13 @@ app.post("/v1/provider/config", async (req, res) => {
     return res.status(400).json({ error: "API Key is required for first-time save." });
   }
 
-  await saveProviderConfig({ ...result.data, apiKey: resolvedApiKey });
+  // Merge: preserve existing thinking config when not provided in request
+  const merged: ProviderConfig = {
+    ...current,
+    ...result.data,
+    apiKey: resolvedApiKey,
+  };
+  await saveProviderConfig(merged);
   return res.json({ ok: true });
 });
 
@@ -132,6 +142,10 @@ app.get("/v1/provider/config", async (_req, res) => {
     firstTokenTimeout: config.firstTokenTimeout,
     overallTimeout: config.overallTimeout,
     hasApiKey: Boolean(config.apiKey),
+    enableThinking: config.enableThinking ?? false,
+    includeReasoningContent: config.includeReasoningContent ?? true,
+    thinkingEffort: config.thinkingEffort ?? "high",
+    thinkingFormat: config.thinkingFormat ?? "deepseek",
   });
 });
 
@@ -148,6 +162,10 @@ const presetSchema = z.object({
     maxTokens: z.number().int().positive().optional(),
     firstTokenTimeout: z.number().int().min(5).max(120).optional(),
     overallTimeout: z.number().int().min(30).max(600).optional(),
+    enableThinking: z.boolean().optional(),
+    includeReasoningContent: z.boolean().optional(),
+    thinkingEffort: z.enum(["medium", "high"]).optional(),
+    thinkingFormat: z.enum(["deepseek", "openai"]).optional(),
   }),
 });
 
@@ -203,10 +221,17 @@ app.post("/v1/presets/:id/activate", async (req, res) => {
   return res.json({ ok: true });
 });
 
-app.get("/v1/provider/models", async (_req, res) => {
-  const config = await loadProviderConfig();
+app.get("/v1/provider/models", async (req, res) => {
+  let config = await loadProviderConfig();
+
+  // Fallback: if no saved config, try query parameters from the frontend
   if (!config) {
-    return res.status(400).json({ error: "Provider config missing. Please save base_url/api_key first." });
+    const baseUrl = typeof req.query.baseUrl === "string" ? req.query.baseUrl.trim() : "";
+    const apiKey = typeof req.query.apiKey === "string" ? req.query.apiKey.trim() : "";
+    if (!baseUrl || !apiKey) {
+      return res.status(400).json({ error: "尚未保存模型配置。请先填写 Base URL 和 API Key 后刷新模型列表。" });
+    }
+    config = { baseUrl, apiKey, model: "" };
   }
 
   try {
@@ -539,7 +564,7 @@ async function runAgentIteration(
   onEvent: (event: any) => void,
   signal: AbortSignal,
   iteration: number
-): Promise<{ reply: string; actionPlan: ActionPlan | null; done: boolean; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
+): Promise<{ reply: string; actionPlan: ActionPlan | null; done: boolean; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
   const result = await streamOpenAICompatible(
     provider,
     messages,
@@ -572,32 +597,32 @@ async function runAgentIteration(
       summary = taskArgs.summary || summary;
       onEvent({ type: "task_complete", summary });
       await logIterationEnd("", { iteration, done: true, reason: `task_complete: ${summary}` });
-      return { reply: summary, actionPlan: null, done: true, toolCalls: result.toolCalls };
+      return { reply: summary, actionPlan: null, done: true, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
     }
 
     // Check if all tool calls are perception-only
     if (isPerceptionOnlyPlan(actionPlan)) {
       onEvent({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
       await logIterationEnd("", { iteration, done: false, reason: "perception_only_plan" });
-      return { reply: result.reply, actionPlan, done: false, toolCalls: result.toolCalls };
+      return { reply: result.reply, actionPlan, done: false, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
     }
 
     // Check if tool calls are iterable (perception + safe action tools) - continue loop
     if (isIterablePlan(actionPlan)) {
       onEvent({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
       await logIterationEnd("", { iteration, done: false, reason: "iterable_plan" });
-      return { reply: result.reply, actionPlan, done: false, toolCalls: result.toolCalls };
+      return { reply: result.reply, actionPlan, done: false, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
     }
 
     // Mixed or action-only: send action_plan event and finish
     onEvent({ type: "action_plan", plan: actionPlan });
     await logIterationEnd("", { iteration, done: true, reason: "action_plan" });
-    return { reply: result.reply, actionPlan, done: true, toolCalls: result.toolCalls };
+    return { reply: result.reply, actionPlan, done: true, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
   }
 
   // No tool calls — final reply
   await logIterationEnd("", { iteration, done: true, reason: "final_reply" });
-  return { reply: result.reply, actionPlan: result.actionPlan, done: true };
+  return { reply: result.reply, actionPlan: result.actionPlan, done: true, reasoningContent: result.reasoningContent };
 }
 
 app.post("/v1/chat/agent-stream", async (req, res) => {
@@ -657,7 +682,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
     while (iteration < maxIterations) {
       iteration++;
 
-      let iterationResult: { reply: string; actionPlan: ActionPlan | null; done: boolean; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
+      let iterationResult: { reply: string; actionPlan: ActionPlan | null; done: boolean; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
       try {
         iterationResult = await runAgentIteration(
           provider,
@@ -718,10 +743,16 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
       // preceding assistant message is present.  Orphaned tool_calls (where the
       // user abandons the session) are cleaned up by sanitizeMessages() before
       // each LLM call.
+      //
+      // reasoning_content is always included for tool-call rounds (DeepSeek
+      // requires it, otherwise 400).  For non-tool-call rounds we respect the
+      // includeReasoningContent config.
+      const wantReasoning = provider.includeReasoningContent ?? true;
       if (iterationResult.toolCalls && iterationResult.toolCalls.length > 0) {
         currentMessages.push({
           role: "assistant",
           content: iterationResult.reply,
+          reasoning_content: iterationResult.reasoningContent,
           tool_calls: iterationResult.toolCalls,
         });
       } else if (iterationResult.actionPlan && iterationResult.actionPlan.actions.length > 0) {
@@ -737,12 +768,14 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
         currentMessages.push({
           role: "assistant",
           content: iterationResult.reply,
+          reasoning_content: iterationResult.reasoningContent,
           tool_calls: syntheticToolCalls,
         });
       } else if (iterationResult.reply) {
         currentMessages.push({
           role: "assistant",
           content: iterationResult.reply,
+          reasoning_content: wantReasoning ? iterationResult.reasoningContent : undefined,
         });
       }
 
@@ -916,7 +949,7 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: "start", ts: Date.now() })}
 \n`);
 
-    let result: { reply: string; actionPlan: ActionPlan | null; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
+    let result: { reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
     try {
       result = await streamOpenAICompatible(
         provider,
@@ -955,10 +988,16 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     // Always persist tool_calls so that when the client later sends tool
     // results via agent-continue, the preceding assistant message is present.
     // Orphaned tool_calls are cleaned up by sanitizeMessages() before each LLM call.
+    //
+    // reasoning_content is always included for tool-call rounds (DeepSeek
+    // requires it, otherwise 400).  For non-tool-call rounds we respect the
+    // includeReasoningContent config.
+    const wantReasoning = provider.includeReasoningContent ?? true;
     if (result.toolCalls && result.toolCalls.length > 0) {
       session.messages.push({
         role: "assistant",
         content: result.reply,
+        reasoning_content: result.reasoningContent,
         tool_calls: result.toolCalls,
       });
     } else if (result.actionPlan && result.actionPlan.actions.length > 0) {
@@ -974,12 +1013,14 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       session.messages.push({
         role: "assistant",
         content: result.reply,
+        reasoning_content: result.reasoningContent,
         tool_calls: syntheticToolCalls,
       });
     } else if (result.reply) {
       session.messages.push({
         role: "assistant",
         content: result.reply,
+        reasoning_content: wantReasoning ? result.reasoningContent : undefined,
       });
     }
 
