@@ -4,3 +4,4 @@ dist/
 .env.*
 apps/local-agent/data/uploads/
 apps/local-agent/data/indexes/
+plans/
