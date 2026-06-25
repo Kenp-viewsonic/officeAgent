@@ -26,15 +26,31 @@ declare namespace Word {
   interface Range {
     text: string;
     font: Word.Font;
+    style: string;
     insertText(text: string, location: Word.InsertLocation): Word.Range;
     insertHtml(html: string, location: Word.InsertLocation): Word.Range;
     insertParagraph(paragraphText: string, insertLocation: Word.InsertLocation): Word.Paragraph;
+    insertTable(
+      rowCount: number,
+      columnCount: number,
+      insertLocation: InsertLocation,
+      values?: string[][]
+    ): Word.Table;
     load(option: string | string[]): void;
     search(searchText: string, options?: Word.SearchOptions): Word.SearchRangeCollection;
     paragraphs: Word.ParagraphCollection;
     getFirst(): Word.Range;
     /** Returns HTML representation of the range; access .value after context.sync() */
     getHtml(preferredFragmentOnly?: boolean): { value: string };
+  }
+
+  interface Table {
+    style: string;
+    /** Built-in style name (e.g. "TableGrid"). Setting this is the supported
+     *  way to apply a built-in Word table style. */
+    styleBuiltIn: string;
+    values: string[][];
+    load(option: string | string[]): void;
   }
 
   interface Font {

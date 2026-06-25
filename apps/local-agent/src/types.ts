@@ -16,6 +16,12 @@ export type ProviderConfig = {
   /** Parameter format: "deepseek" uses `thinking` + `reasoning_effort`;
    *  "openai" uses `chat_template_kwargs.enable_thinking`. */
   thinkingFormat?: "deepseek" | "openai";
+  /**
+   * Maximum iterations the agent loop may run before forcibly stopping.
+   * Per-preset so different models can be tuned independently (e.g.
+   * DeepSeek for deep research, Agnes for shallow edits). 1..50.
+   */
+  maxIterations?: number;
 };
 
 export type ConfigPreset = {
@@ -125,6 +131,8 @@ export type AgentSession = {
   insertMode?: string;
   /** Cached dynamic context (documentContext / selection) for agent-continue */
   dynamicContext?: { documentContext?: string; selection?: string };
+  /** Internal counter for agent-continue iteration tracking */
+  _continueIteration?: number;
 };
 
 // --- Tool Definitions (OpenAI Function Calling format) ---

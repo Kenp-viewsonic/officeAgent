@@ -144,7 +144,7 @@ body {
 .chat-card {
   flex: 1;
   overflow: hidden;
-  grid-template-rows: auto auto auto 1fr auto auto auto auto;
+  grid-template-rows: auto auto auto 1fr auto auto;
 }
 
 .subcard {
@@ -188,7 +188,7 @@ textarea {
 button {
   border: 0;
   border-radius: 6px;
-  padding: 6px 8px;
+  padding: 5px 10px;
   background: var(--brand);
   color: #fff;
   cursor: pointer;
@@ -206,6 +206,40 @@ button.danger {
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── Chat action bar (single-row) ───────────────────────────────────────── */
+
+.chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 0;
+  flex-wrap: wrap;
+}
+
+.chat-actions .icon-only {
+  padding: 5px 9px;
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.chat-actions button.primary {
+  background: var(--brand);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.chat-actions button.danger {
+  background: var(--danger);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.chat-actions select.flex-1 {
+  flex: 1 1 auto;
+  min-width: 110px;
 }
 
 .row {

@@ -96,9 +96,9 @@
         <section class="subcard">
           <h2>Agent 行为</h2>
           <label>最大迭代次数（防止无限循环）
-            <input id="maxIterations" type="number" min="1" max="20" step="1" value="10" />
+            <input id="maxIterations" type="number" min="1" max="50" step="1" value="10" />
           </label>
-          <p class="status" style="color:var(--muted);">数值越大，Agent 能执行越复杂的多步任务。建议 8-15。</p>
+          <p class="status" style="color:var(--muted);">数值越大，Agent 能执行越复杂的多步任务。建议 8-15。<br><strong>跟随当前模型配置保存</strong>，切换预设方案时自动跟随对应模型的值。</p>
         </section>
 
         <section class="subcard">
@@ -150,24 +150,18 @@
           <span id="attachmentSize" class="attachment-size"></span>
           <button id="removeAttachment" class="secondary danger" type="button">✕</button>
         </div>
-        <div class="row actions">
+        <div class="chat-actions">
           <input id="fileInput" type="file" accept=".txt,.md,.json,.csv,.xml,.yaml,.yml,.log,.ini,.cfg,.conf,.toml,.py,.js,.ts,.java,.c,.cpp,.h,.hpp,.go,.rs,.rb,.php,.sh,.bat,.ps1,.sql,.html,.css,.svg" hidden />
-          <button id="attachBtn" class="secondary" type="button" title="附加纯文本文件">📎 附件</button>
-          <button id="sendMsg">发送</button>
-          <select id="insertMode">
-            <option value="smart_action">智能操作（LLM 决定）</option>
-            <option value="chat_only">仅对话，不操作文档</option>
-            <option value="replace_selection">替换当前选区</option>
-            <option value="append_end">追加到文末</option>
+          <button id="attachBtn" class="secondary icon-only" type="button" title="附加纯文本文件">📎</button>
+          <button id="sendMsg" class="primary">发送</button>
+          <button id="stopBtn" class="danger" type="button" title="停止当前生成" style="display:none;">⏹ 停止</button>
+          <button id="retryLast" class="secondary icon-only" type="button" title="重试上一条">🔁</button>
+          <select id="insertMode" class="flex-1">
+            <option value="smart_action">智能操作</option>
+            <option value="chat_only">仅对话</option>
+            <option value="replace_selection">替换选区</option>
+            <option value="append_end">追加文末</option>
           </select>
-        </div>
-        <div class="row actions">
-          <button id="insertReply" class="secondary">替换当前选区为最后回复</button>
-          <button id="retryLast" class="secondary" type="button">重试上一条</button>
-        </div>
-        <div class="row actions">
-          <button id="insertReplyCursor" class="secondary" type="button">插入最后回复到光标</button>
-          <span></span>
         </div>
 
         <!-- Action Plan Preview Panel -->

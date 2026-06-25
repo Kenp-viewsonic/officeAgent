@@ -5,7 +5,7 @@ import path from "node:path";
 import mammoth from "mammoth";
 import { z } from "zod";
 import { createSession, getSession, appendToSession, deleteSession } from "./agent-session.js";
-import { callOpenAICompatible, describeDocumentStructure, isPerceptionOnlyPlan, isIterablePlan, listOpenAICompatibleModels, LlmHttpError, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
+import { callOpenAICompatible, describeDocumentStructure, isPerceptionOnlyPlan, isIterablePlan, listOpenAICompatibleModels, LlmHttpError, parseActionPlanFromToolCalls, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
 import { keywordRetrieve, splitToChunks } from "./retrieval.js";
 import { appendChunks, clearAllChunks, deleteChunksByFile, getKbFileList, getKbStats, importChunks, loadChunks, loadProviderConfig, saveProviderConfig, loadPresets, savePreset, deletePreset } from "./store.js";
 import { ActionPlan, ChatMessage, DocumentStructure, ProviderConfig, ConfigPreset, RetrievalChunk } from "./types.js";
@@ -104,6 +104,7 @@ const configSchema = z.object({
   includeReasoningContent: z.boolean().optional(),
   thinkingEffort: z.enum(["medium", "high"]).optional(),
   thinkingFormat: z.enum(["deepseek", "openai"]).optional(),
+  maxIterations: z.number().int().min(1).max(50).optional(),
 });
 
 app.post("/v1/provider/config", async (req, res) => {
@@ -146,6 +147,7 @@ app.get("/v1/provider/config", async (_req, res) => {
     includeReasoningContent: config.includeReasoningContent ?? true,
     thinkingEffort: config.thinkingEffort ?? "high",
     thinkingFormat: config.thinkingFormat ?? "deepseek",
+    maxIterations: config.maxIterations ?? 10,
   });
 });
 
@@ -166,6 +168,7 @@ const presetSchema = z.object({
     includeReasoningContent: z.boolean().optional(),
     thinkingEffort: z.enum(["medium", "high"]).optional(),
     thinkingFormat: z.enum(["deepseek", "openai"]).optional(),
+    maxIterations: z.number().int().min(1).max(50).optional(),
   }),
 });
 
@@ -395,17 +398,18 @@ async function buildChatContext(payload: z.infer<typeof chatSchema>) {
     documentStructureDescription = describeDocumentStructure(payload.documentStructure);
   }
 
-  // NOTE: documentContext / selection are NOT injected as a leading system
-  // message anymore. They are passed through as `dynamicContext` and appended
-  // as a TRAILING system message inside buildPayload(), so the stable system
-  // prompt + conversation history prefix stays cacheable.
+  // NOTE: documentContext is only useful for chat_only mode where the LLM
+  // cannot call read_document.  In agent mode the model can fetch the parts
+  // it needs on demand — sending the full text in every request wastes
+  // context window and confuses the model ("I need to scan everything").
+  const insertMode = payload.insertMode || "smart_action";
   const dynamicContext: { documentContext?: string; selection?: string } = {};
-  if (payload.documentContext) dynamicContext.documentContext = payload.documentContext;
+  if (insertMode === "chat_only" && payload.documentContext) {
+    dynamicContext.documentContext = payload.documentContext;
+  }
   if (payload.selection) dynamicContext.selection = payload.selection;
 
   const enrichedMessages: ChatMessage[] = messages;
-
-  const insertMode = payload.insertMode || "smart_action";
 
   return { provider, enrichedMessages, retrieved, documentStructureDescription, insertMode, dynamicContext };
 }
@@ -563,7 +567,8 @@ async function runAgentIteration(
   dynamicContext: { documentContext?: string; selection?: string } | undefined,
   onEvent: (event: any) => void,
   signal: AbortSignal,
-  iteration: number
+  iteration: number,
+  traceId: string
 ): Promise<{ reply: string; actionPlan: ActionPlan | null; done: boolean; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
   const result = await streamOpenAICompatible(
     provider,
@@ -596,32 +601,32 @@ async function runAgentIteration(
       const taskArgs = safeParseToolArgs(taskCompleteCall.function.arguments);
       summary = taskArgs.summary || summary;
       onEvent({ type: "task_complete", summary });
-      await logIterationEnd("", { iteration, done: true, reason: `task_complete: ${summary}` });
+      await logIterationEnd(traceId, { iteration, done: true, reason: `task_complete: ${summary}` });
       return { reply: summary, actionPlan: null, done: true, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
     }
 
     // Check if all tool calls are perception-only
     if (isPerceptionOnlyPlan(actionPlan)) {
       onEvent({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
-      await logIterationEnd("", { iteration, done: false, reason: "perception_only_plan" });
+      await logIterationEnd(traceId, { iteration, done: false, reason: "perception_only_plan" });
       return { reply: result.reply, actionPlan, done: false, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
     }
 
     // Check if tool calls are iterable (perception + safe action tools) - continue loop
     if (isIterablePlan(actionPlan)) {
       onEvent({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
-      await logIterationEnd("", { iteration, done: false, reason: "iterable_plan" });
+      await logIterationEnd(traceId, { iteration, done: false, reason: "iterable_plan" });
       return { reply: result.reply, actionPlan, done: false, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
     }
 
     // Mixed or action-only: send action_plan event and finish
     onEvent({ type: "action_plan", plan: actionPlan });
-    await logIterationEnd("", { iteration, done: true, reason: "action_plan" });
+    await logIterationEnd(traceId, { iteration, done: true, reason: "action_plan" });
     return { reply: result.reply, actionPlan, done: true, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
   }
 
   // No tool calls — final reply
-  await logIterationEnd("", { iteration, done: true, reason: "final_reply" });
+  await logIterationEnd(traceId, { iteration, done: true, reason: "final_reply" });
   return { reply: result.reply, actionPlan: result.actionPlan, done: true, reasoningContent: result.reasoningContent };
 }
 
@@ -694,7 +699,8 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
           (event) => res.write(`data: ${JSON.stringify(event)}
 \n`),
           abortController.signal,
-          iteration
+          iteration,
+          httpTraceId
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
@@ -847,6 +853,32 @@ const agentContinueSchema = z.object({
   documentStructure: documentStructureSchema.optional(),
 });
 
+/**
+ * Abort an in-flight agent session.
+ *
+ * The frontend Stop button calls this with the current `pendingSessionId` so
+ * that any subsequent `/v1/chat/agent-continue` request — even one that
+ * raced past the AbortController — will hit `Session not found` and bail.
+ * The session map's per-session TTL (30 min) already cleans up stragglers,
+ * but for an explicit stop we want the kill to be immediate.
+ *
+ * This endpoint does NOT abort already-running LLM streams; the in-flight
+ * `/v1/chat/agent-stream` and `/v1/chat/agent-continue` requests tear
+ * themselves down via `req.on("aborted")` / `res.on("close")` when the
+ * client closes the connection.
+ */
+app.post("/v1/chat/abort", async (req, res) => {
+  const sessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId : "";
+  if (sessionId) {
+    const removed = deleteSession(sessionId);
+    await logHttpRequest("/v1/chat/abort", {
+      method: "POST",
+      body: { sessionId, removed },
+    });
+  }
+  return res.json({ ok: true });
+});
+
 app.post("/v1/chat/agent-continue", async (req, res) => {
   const parsed = agentContinueSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -868,7 +900,7 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       return res.status(404).json({ error: "Session not found or expired" });
     }
 
-    await logHttpRequest("/v1/chat/agent-continue", {
+    const httpTraceId = await logHttpRequest("/v1/chat/agent-continue", {
       method: "POST",
       sessionId: parsed.data.sessionId,
       body: {
@@ -908,18 +940,15 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       insertMode: insertMode as any,
     });
 
-    // Ensure the session has an assistant message with tool_calls before tool results
-    // If the last message is assistant but has no tool_calls, or is not assistant,
-    // we need to handle this gracefully
-    // Note: there may be trailing system messages (goal reminders) after the assistant msg,
-    // so walk backwards to find the actual last assistant message.
+    // Ensure the session has an assistant message with tool_calls before tool results.
+    // If the last message is not assistant or has no tool_calls, bail out.
     const lastAssistantIdx = [...session.messages].reverse().findIndex((m) => m.role === "assistant");
     if (lastAssistantIdx === -1) {
       return res.status(400).json({ error: "无法继续 Agent 循环：会话中没有 assistant 消息，无法附加工具结果。" });
     }
     const lastAssistant = session.messages[session.messages.length - 1 - lastAssistantIdx];
     if (!lastAssistant.tool_calls || lastAssistant.tool_calls.length === 0) {
-      return res.status(400).json({ error: "无法继续 Agent 循环：最后一条 assistant 消息不包含 tool_calls，可能操作已在本地解析完成。" });
+      return res.status(400).json({ error: "无法继续 Agent 循环：上一轮 assistant 消息没有 tool_calls（通常是 tool_call_id 失配或 LLM 忽略工具结果导致的）。建议重新发起任务。" });
     }
 
     // Append tool results to session messages
@@ -932,15 +961,6 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       });
     }
 
-    // Inject goal reminder after tool results to prevent premature task completion
-    const originalUserMsg = session.messages.find((m) => m.role === "user");
-    if (originalUserMsg) {
-      session.messages.push({
-        role: "system",
-        content: `【目标提醒】用户的原始请求是：「${originalUserMsg.content.slice(0, 200)}」。请回顾此目标，确认是否所有操作都已完成并通过验证。如果还有未完成的部分，继续执行；只有确认所有目标都达成后才调用 task_complete。`,
-      });
-    }
-
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
@@ -948,6 +968,11 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
 
     res.write(`data: ${JSON.stringify({ type: "start", ts: Date.now() })}
 \n`);
+
+    // Track the iteration for this continue cycle (always 1 since agent-continue
+    // does max one LLM call per request; the loop is driven by the frontend).
+    const continueIteration = (session._continueIteration ? session._continueIteration + 1 : 1);
+    session._continueIteration = continueIteration;
 
     let result: { reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
     try {
@@ -1032,17 +1057,24 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
         let summary = "任务已完成";
         const taskArgs = safeParseToolArgs(taskCompleteCall.function.arguments);
         summary = taskArgs.summary || summary;
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: `task_complete: ${summary}` });
         res.write(`data: ${JSON.stringify({ type: "task_complete", summary })}\n\n`);
       } else {
         const actionPlan = parseActionPlanFromToolCalls(result.toolCalls);
         if (isPerceptionOnlyPlan(actionPlan)) {
+          await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: false, reason: "perception_only_plan" });
           res.write(`data: ${JSON.stringify({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}\n\n`);
         } else if (isIterablePlan(actionPlan)) {
+          await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: false, reason: "iterable_plan" });
           res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}\n\n`);
         } else {
+          await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "action_plan" });
           res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}\n\n`);
         }
       }
+    } else {
+      // No tool calls — final reply from agent-continue
+      await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "final_reply" });
     }
 
     res.write(`data: ${JSON.stringify({
@@ -1083,25 +1115,6 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     return res.end();
   }
 });
-
-// Helper needed by agent endpoints
-function parseActionPlanFromToolCalls(
-  toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>
-): ActionPlan {
-  const actions = toolCalls.map((tc) => {
-    const params = safeParseToolArgs(tc.function.arguments);
-    return {
-      action: tc.function.name,
-      params,
-      description: `${tc.function.name}: ${JSON.stringify(params).slice(0, 100)}`,
-    };
-  });
-
-  return {
-    actions,
-    explanation: actions.map((a) => a.description).join("；"),
-  };
-}
 
 // SPA fallback: serve index.html for non-API routes
 app.get("*", (_req, res) => {

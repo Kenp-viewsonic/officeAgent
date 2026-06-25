@@ -82,6 +82,7 @@ const state: {
   pendingSimpleInsert: SimpleInsertPlan | null;
   pendingSessionId: string | null;
   pendingAttachment: { fileName: string; content: string } | null;
+  isAgentRunning: boolean;
 } = {
   sessions: [],
   activeSessionId: null,
@@ -90,7 +91,15 @@ const state: {
   pendingSimpleInsert: null,
   pendingSessionId: null,
   pendingAttachment: null,
+  isAgentRunning: false,
 };
+
+// Module-level AbortController shared by all in-flight fetch calls in the
+// agent loop. Replaced before every request; aborted by the Stop button to
+// immediately tear down SSE streams and any pending /v1/chat/agent-continue
+// calls. See /v1/chat/abort for the server-side companion that deletes the
+// session to prevent continued iteration.
+let currentAbortController: AbortController | null = null;
 
 // ─── DOM Helpers ─────────────────────────────────────────────────────────────
 
@@ -114,6 +123,32 @@ const insertModeSelect = $<HTMLSelectElement>("insertMode");
 const actionPlanPanel = $<HTMLDivElement>("actionPlanPanel");
 const actionPlanContent = $<HTMLDivElement>("actionPlanContent");
 const fileInput = $<HTMLInputElement>("fileInput");
+const sendBtn = $<HTMLButtonElement>("sendMsg");
+const stopBtn = $<HTMLButtonElement>("stopBtn");
+const attachBtnEl = $<HTMLButtonElement>("attachBtn");
+
+/**
+ * Toggle UI between "sending" and "idle" states.
+ *
+ * - `sendBtn` and `stopBtn` are mutually exclusive: the stop button is only
+ *   visible while an agent loop is in flight.
+ * - Input and attachment controls are locked while running so the user cannot
+ *   trigger a second request mid-stream.
+ * - Keyboard Enter-to-send is also blocked at the same time.
+ */
+function setRunningState(running: boolean): void {
+  state.isAgentRunning = running;
+  sendBtn.style.display = running ? "none" : "";
+  stopBtn.style.display = running ? "" : "none";
+  userInput.disabled = running;
+  attachBtnEl.disabled = running;
+  if (running) {
+    sendBtn.classList.add("is-running");
+  } else {
+    sendBtn.classList.remove("is-running");
+    currentAbortController = null;
+  }
+}
 const attachBtn = $<HTMLButtonElement>("attachBtn");
 const dropZone = $<HTMLDivElement>("dropZone");
 const dropOverlay = $<HTMLDivElement>("dropOverlay");
@@ -248,10 +283,34 @@ type ProviderConfigView = {
   includeReasoningContent?: boolean;
   thinkingEffort?: "medium" | "high";
   thinkingFormat?: "deepseek" | "openai";
+  maxIterations?: number;
 };
+
+/**
+ * In-memory cache of the last server-persisted provider config. Used by
+ * sendMessage so it can read `maxIterations` (and other server-side fields)
+ * without re-querying. Refreshed on `loadProviderConfig()` and on
+ * `saveProviderConfig()` success.
+ */
+let cachedProviderConfig: ProviderConfigView | null = null;
 
 function setStatus(target: HTMLParagraphElement, text: string): void {
   target.textContent = text;
+}
+
+/**
+ * Detect whether an error came from a fetch() that was aborted by the
+ * Stop button. Treats both the standard DOMException("AbortError") and the
+ * Node-style `name === "AbortError"` sentinel as user stops.
+ */
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = (error as { name?: string }).name;
+  if (name === "AbortError") return true;
+  // fetch() in some browsers rejects with a TypeError carrying an internal
+  // "aborted" flag — fall back to that.
+  const message = (error as { message?: string }).message ?? "";
+  return /aborted|abort\(\)/i.test(message);
 }
 
 // ─── Chat Log Constants ──────────────────────────────────────────────────────
@@ -910,12 +969,14 @@ async function loadProviderConfig(): Promise<void> {
     }
 
     const data = (await res.json()) as ProviderConfigView;
+    cachedProviderConfig = data;
     $<HTMLInputElement>("baseUrl").value = data.baseUrl || "";
     $<HTMLInputElement>("model").value = data.model || "";
     $<HTMLInputElement>("temperature").value = String(data.temperature ?? 0.2);
     $<HTMLInputElement>("maxTokens").value = String(data.maxTokens ?? 900);
     $<HTMLInputElement>("firstTokenTimeout").value = String(data.firstTokenTimeout ?? 20);
     $<HTMLInputElement>("overallTimeout").value = String(data.overallTimeout ?? 240);
+    $<HTMLInputElement>("maxIterations").value = String(data.maxIterations ?? 10);
 
     const apiKeyInput = $<HTMLInputElement>("apiKey");
     apiKeyInput.value = "";
@@ -1011,6 +1072,7 @@ async function saveProviderConfig(): Promise<void> {
       includeReasoningContent: $<HTMLInputElement>("includeReasoningContent").checked,
       thinkingEffort: $<HTMLSelectElement>("thinkingEffort").value,
       thinkingFormat: $<HTMLSelectElement>("thinkingFormat").value,
+      maxIterations: Number($<HTMLInputElement>("maxIterations").value || "10"),
     };
 
     // 只在用户实际输入了 apiKey 时才发送，否则由后端保留已保存的 key
@@ -1029,6 +1091,24 @@ async function saveProviderConfig(): Promise<void> {
       setStatus(configStatus, `保存失败: ${err}`);
       return;
     }
+
+    // Update the in-memory cache so sendMessage sees the new value
+    // without a roundtrip. We don't have the saved payload verbatim, so
+    // merge the typed-in values over whatever was previously cached.
+    cachedProviderConfig = {
+      baseUrl: body.baseUrl,
+      model: body.model,
+      temperature: body.temperature,
+      maxTokens: body.maxTokens,
+      firstTokenTimeout: body.firstTokenTimeout,
+      overallTimeout: body.overallTimeout,
+      hasApiKey: cachedProviderConfig?.hasApiKey ?? false,
+      enableThinking: body.enableThinking,
+      includeReasoningContent: body.includeReasoningContent,
+      thinkingEffort: body.thinkingEffort,
+      thinkingFormat: body.thinkingFormat,
+      maxIterations: body.maxIterations,
+    };
 
     setStatus(configStatus, apiKeyRaw ? "保存成功" : "保存成功（API Key 已保留）");
   } catch (error) {
@@ -2064,8 +2144,22 @@ async function executeAction(action: WordAction): Promise<string> {
         await context.sync();
 
         if (paragraph_index >= 0 && paragraph_index < paragraphs.items.length) {
-          paragraphs.items[paragraph_index].delete();
-          await context.sync();
+          try {
+            paragraphs.items[paragraph_index].delete();
+            await context.sync();
+          } catch (e: any) {
+            // Office.js throws GeneralException when the document is
+            // read-only, protected, or the user lacks edit permissions.
+            const isGeneral = e?.code === "GeneralException" || e?.message === "GeneralException";
+            if (isGeneral) {
+              throw new Error(
+                `delete_paragraph 失败：无法删除段落 ${paragraph_index}。` +
+                `可能原因：文档处于只读模式、受保护视图、或当前没有编辑权限。` +
+                `请通知用户检查文档是否可编辑（如点击"启用编辑"按钮），然后重试。`
+              );
+            }
+            throw e;
+          }
           return `已删除段落 ${paragraph_index}`;
         }
         throw new Error(`delete_paragraph 失败：段落序号 ${paragraph_index} 超出范围（文档共 ${paragraphs.items.length} 段）。请先调用 read_document 确认段落序号。`);
@@ -2284,6 +2378,130 @@ async function executeAction(action: WordAction): Promise<string> {
         return `已撤销最近 ${count} 步操作`;
       }
 
+      case "insert_table": {
+        const {
+          location,
+          heading_text,
+          paragraph_index,
+          headers = [],
+          rows,
+          style = "TableGrid",
+        } = action.params;
+
+        if (!Array.isArray(rows) || rows.length === 0) {
+          throw new Error("rows 必须是非空数组");
+        }
+        if (!location) {
+          throw new Error("缺少 location 参数");
+        }
+
+        // Normalize rows: ensure every row is an array of strings, and pad
+        // short rows with empty strings to match the longest row (or the
+        // headers length, whichever is greater). Auto-align is intentional
+        // — see Phase 3 design decision.
+        const stringRows: string[][] = rows.map((r: unknown) => {
+          if (!Array.isArray(r)) {
+            throw new Error("rows 元素必须是字符串数组");
+          }
+          return r.map((c) => (c == null ? "" : String(c)));
+        });
+        const allRows: string[][] = headers.length > 0
+          ? [headers.map((h: unknown) => (h == null ? "" : String(h))), ...stringRows]
+          : stringRows;
+        const colCount = Math.max(...allRows.map((r) => r.length));
+        if (colCount === 0) {
+          throw new Error("表格至少需要 1 列");
+        }
+        const normalized = allRows.map((r) => {
+          const padded = [...r];
+          while (padded.length < colCount) padded.push("");
+          return padded;
+        });
+        const rowCount = normalized.length;
+        // Built-in style names like "TableGrid" must be set via Table.styleBuiltIn
+        // (enum), not Table.style (which is for custom/localized names). Setting
+        // an invalid string on `style` causes Word to throw a GeneralException
+        // because the named style does not exist in the document's style table.
+        const tableStyleBuiltIn = (style || "TableGrid") as string;
+
+        // Office.js requires the proxy object to be `.load`-ed and `context.sync()`
+        // round-tripped before setting `styleBuiltIn`. The set is deferred to
+        // a follow-up sync to keep the change batch isolated from insertion.
+        const applyTableStyle = async (table: Word.Table): Promise<void> => {
+          try {
+            (table as any).styleBuiltIn = tableStyleBuiltIn;
+            await context.sync();
+          } catch (e) {
+            console.warn(`[insert_table] failed to apply style ${tableStyleBuiltIn}:`, e);
+          }
+        };
+
+        if (location === "after_heading") {
+          if (!heading_text) {
+            throw new Error("location=after_heading 时必须提供 heading_text");
+          }
+          const matches = body.search(heading_text, { matchCase: false, matchWholeWord: false });
+          matches.load("items");
+          await context.sync();
+          if (matches.items.length === 0) {
+            throw new Error(`未找到标题 "${heading_text}"`);
+          }
+          const para = matches.items[0].paragraphs.getFirst();
+          para.load("text");
+          await context.sync();
+          // Insert by first obtaining the paragraph's range — `insertTable` is a
+          // method on Range, not on Paragraph, in the real Word API.
+          const range: Word.Range = para.getRange("Content");
+          const table: Word.Table = range.insertTable(rowCount, colCount, "After", normalized);
+          await context.sync();
+          await applyTableStyle(table);
+          return `已在标题 "${heading_text}" 后插入 ${rowCount} × ${colCount} 表格`;
+        }
+
+        if (location === "after_paragraph") {
+          if (typeof paragraph_index !== "number") {
+            throw new Error("location=after_paragraph 时必须提供 paragraph_index");
+          }
+          const paragraphs = body.paragraphs;
+          paragraphs.load("items");
+          await context.sync();
+          if (paragraph_index < 0 || paragraph_index >= paragraphs.items.length) {
+            throw new Error(`paragraph_index ${paragraph_index} 越界（共 ${paragraphs.items.length} 段）`);
+          }
+          const target = paragraphs.items[paragraph_index];
+          target.load("text");
+          await context.sync();
+          // Insert via the paragraph's own range so Word creates the table as
+          // a sibling of the paragraph (After the paragraph's content range),
+          // rather than trying to splice into the paragraph's body.
+          const range: Word.Range = target.getRange("Content");
+          const table: Word.Table = range.insertTable(rowCount, colCount, "After", normalized);
+          await context.sync();
+          await applyTableStyle(table);
+          return `已在段落 ${paragraph_index} 后插入 ${rowCount} × ${colCount} 表格`;
+        }
+
+        if (location === "at_end") {
+          const lastPara = body.paragraphs.getLast();
+          lastPara.load("text");
+          await context.sync();
+          const range: Word.Range = lastPara.getRange("Content");
+          const table: Word.Table = range.insertTable(rowCount, colCount, "After", normalized);
+          await context.sync();
+          await applyTableStyle(table);
+          return `已追加 ${rowCount} × ${colCount} 表格到文档末尾`;
+        }
+
+        // at_cursor (default fallback): insert at the end of the current
+        // selection so the table lands as a sibling, not replacing the
+        // selection's content.
+        const selection = context.document.getSelection();
+        const table: Word.Table = selection.insertTable(rowCount, colCount, "After", normalized);
+        await context.sync();
+        await applyTableStyle(table);
+        return `已在光标处插入 ${rowCount} × ${colCount} 表格`;
+      }
+
       default:
         return `未知操作: ${action.action}`;
     }
@@ -2333,11 +2551,11 @@ async function executeActionPlan(plan: ActionPlan): Promise<Array<{ toolCallId: 
       });
     } catch (error) {
       const { message, details } = stringifyOfficeError(error);
-      appendToolResultCard(action.action, false, `错误: ${message}`);
+      appendToolResultCard(action.action, false, `错误: ${details}`);
       results.push({
         toolCallId: action.toolCallId ?? `action-${i}`,
         toolName: action.action,
-        result: `错误: ${message}`,
+        result: `错误: ${details}`,
         success: false,
       });
       console.error(`[executeActionPlan] action ${i + 1} (${action.action}) failed:`, details);
@@ -2395,6 +2613,10 @@ function hideActionPlanPreview(): void {
 }
 
 async function confirmActionPlan(): Promise<void> {
+  if (state.isAgentRunning) {
+    setStatus(chatStatus, "正在生成中，请先点 ⏹ 停止");
+    return;
+  }
   if (!state.pendingActionPlan) {
     setStatus(chatStatus, "没有待执行的操作计划");
     return;
@@ -2405,6 +2627,8 @@ async function confirmActionPlan(): Promise<void> {
   console.log("[confirmActionPlan] plan:", JSON.stringify(plan.actions.map(a => ({ action: a.action, toolCallId: a.toolCallId }))));
   console.log("[confirmActionPlan] sessionId:", sessionId);
   hideActionPlanPreview();
+
+  setRunningState(true);
 
   try {
     const results = await executeActionPlan(plan);
@@ -2451,9 +2675,16 @@ async function confirmActionPlan(): Promise<void> {
       setStatus(chatStatus, "操作已执行（无会话ID，无法继续迭代）");
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : "未知错误";
-    console.error("[confirmActionPlan] Error:", message);
-    setStatus(chatStatus, `执行操作失败: ${message}`);
+    if (isAbortError(error)) {
+      setStatus(chatStatus, "已停止生成");
+      state.pendingSessionId = null;
+    } else {
+      const message = error instanceof Error ? error.message : "未知错误";
+      console.error("[confirmActionPlan] Error:", message);
+      setStatus(chatStatus, `执行操作失败: ${message}`);
+    }
+  } finally {
+    setRunningState(false);
   }
 }
 
@@ -2665,14 +2896,15 @@ async function executeSingleTool(
     const result = await executeAction(action);
     return { toolCallId: tool.id, toolName: tool.tool, result, success: true };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "未知错误";
-    return { toolCallId: tool.id, toolName: tool.tool, result: `错误: ${message}`, success: false };
+    const { details } = stringifyOfficeError(error);
+    return { toolCallId: tool.id, toolName: tool.tool, result: `错误: ${details}`, success: false };
   }
 }
 
 /** Tools that change paragraph indices (like iterator invalidation) */
 const STRUCTURE_MUTATING_TOOLS = new Set([
   "insert_after_paragraph", "insert_after_heading", "insert_at_start", "insert_at_end",
+  "insert_table",
   "delete_paragraph", "merge_paragraphs", "undo_last_action",
 ]);
 
@@ -2725,6 +2957,12 @@ async function sendAgentMessageStream(
   citations?: Array<{ fileName: string }>;
   sessionId?: string;
 }> {
+  // Share a single AbortController across the whole multi-turn loop so the
+  // Stop button can tear down every pending /v1/chat/agent-stream and
+  // /v1/chat/agent-continue request, not just the in-flight one.
+  currentAbortController = new AbortController();
+  const abortSignal = currentAbortController.signal;
+
   let sessionId: string | null = null;
   let toolResults: Array<{ toolCallId: string; toolName: string; result: string; success: boolean }> = [];
   let iteration = 0;
@@ -2734,6 +2972,9 @@ async function sendAgentMessageStream(
   let finalCitations: Array<{ fileName: string }> = [];
 
   while (iteration < maxIterations) {
+    if (abortSignal.aborted) {
+      throw new DOMException("Agent loop stopped by user", "AbortError");
+    }
     iteration++;
 
     let res: Response;
@@ -2743,6 +2984,7 @@ async function sendAgentMessageStream(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...payload, enableReAct: true, maxIterations }),
+        signal: abortSignal,
       });
     } else {
       // Continue with tool results — re-read fresh document structure
@@ -2751,6 +2993,7 @@ async function sendAgentMessageStream(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, toolResults, documentStructure: freshDocStructure }),
+        signal: abortSignal,
       });
       toolResults = [];
     }
@@ -2840,6 +3083,12 @@ async function continueAgentLoop(
   retrievalCount?: number;
   citations?: Array<{ fileName: string }>;
 }> {
+  // A new AbortController is created here so the Stop button can also tear
+  // down post-confirmation continuations. Replaces any leftover controller
+  // from the initial sendAgentMessageStream run.
+  currentAbortController = new AbortController();
+  const abortSignal = currentAbortController.signal;
+
   let iteration = 0;
   let finalReply = "";
   let finalActionPlan: ActionPlan | null = null;
@@ -2849,6 +3098,9 @@ async function continueAgentLoop(
   console.log("[continueAgentLoop] Starting with sessionId:", sessionId, "toolResults:", JSON.stringify(toolResults.map(r => ({ toolCallId: r.toolCallId, toolName: r.toolName, success: r.success }))));
 
   while (iteration < maxIterations) {
+    if (abortSignal.aborted) {
+      throw new DOMException("Agent loop stopped by user", "AbortError");
+    }
     iteration++;
     console.log("[continueAgentLoop] Iteration:", iteration);
 
@@ -2859,6 +3111,7 @@ async function continueAgentLoop(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId, toolResults: currentToolResults, documentStructure: freshDocStructure }),
+      signal: abortSignal,
     });
 
     currentToolResults = [];
@@ -2945,83 +3198,143 @@ async function sendMessageStream(
   citations?: Array<{ fileName: string }>;
   sessionId?: string;
 }> {
-  const res = await fetch(`${agentBase}/v1/chat/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  // Share the current abort controller so the Stop button can tear this down.
+  currentAbortController = new AbortController();
 
-  if (!res.ok) {
-    const err = await parseErrorMessage(res);
-    throw new Error(err);
-  }
+  try {
+    const res = await fetch(`${agentBase}/v1/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: currentAbortController.signal,
+    });
 
-  if (!res.body) {
-    throw new Error("流式响应不可用");
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let fullReply = "";
-  let donePayload: { retrievalCount?: number; citations?: Array<{ fileName: string }>; actionPlan?: ActionPlan | null } = {};
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+    if (!res.ok) {
+      const err = await parseErrorMessage(res);
+      throw new Error(err);
     }
 
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
+    if (!res.body) {
+      throw new Error("流式响应不可用");
+    }
 
-    for (const event of events) {
-      const line = event
-        .split("\n")
-        .find((item) => item.trim().startsWith("data:"));
-      if (!line) {
-        continue;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let fullReply = "";
+    let donePayload: { retrievalCount?: number; citations?: Array<{ fileName: string }>; actionPlan?: ActionPlan | null } = {};
+
+    while (true) {
+      if (currentAbortController.signal.aborted) {
+        break;
+      }
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
       }
 
-      const raw = line.slice(5).trim();
-      if (!raw) {
-        continue;
-      }
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
 
-      let data: StreamEvent;
-      try {
-        data = JSON.parse(raw) as StreamEvent;
-      } catch {
-        continue;
-      }
+      for (const event of events) {
+        const line = event
+          .split("\n")
+          .find((item) => item.trim().startsWith("data:"));
+        if (!line) {
+          continue;
+        }
 
-      if (data.type === "delta" && data.delta) {
-        fullReply += data.delta;
-        onDelta(fullReply);
-      }
+        const raw = line.slice(5).trim();
+        if (!raw) {
+          continue;
+        }
 
-      if (data.type === "error") {
-        throw new Error(data.error || "流式响应出错");
-      }
+        let data: StreamEvent;
+        try {
+          data = JSON.parse(raw) as StreamEvent;
+        } catch {
+          continue;
+        }
 
-      if (data.type === "done") {
-        fullReply = data.reply ?? fullReply;
-        donePayload = {
-          retrievalCount: data.retrievalCount,
-          citations: data.citations,
-          actionPlan: data.actionPlan,
-        };
+        if (data.type === "delta" && data.delta) {
+          fullReply += data.delta;
+          onDelta(fullReply);
+        }
+
+        if (data.type === "error") {
+          throw new Error(data.error || "流式响应出错");
+        }
+
+        if (data.type === "done") {
+          fullReply = data.reply ?? fullReply;
+          donePayload = {
+            retrievalCount: data.retrievalCount,
+            citations: data.citations,
+            actionPlan: data.actionPlan,
+          };
+        }
       }
+    }
+
+    return { reply: fullReply.trim(), actionPlan: donePayload.actionPlan ?? null, ...donePayload };
+  } finally {
+    // Controller lifecycle is owned by setRunningState() — nothing to release here.
+  }
+}
+
+/**
+ * Stop any in-flight agent run.
+ *
+ * Two layers of cancellation:
+ *  1. `currentAbortController.abort()` — immediately tears down the active
+ *     fetch/SSE stream so the UI unblocks within a few hundred ms.
+ *  2. `POST /v1/chat/abort` with the pending sessionId — removes the session
+ *     on the server, so any stale agent-continue call (e.g. one the abort
+ *     raced past) cannot keep iterating and re-hit the model.
+ *
+ * The UI swap to "send" is handled by sendMessage's catch/finally (it
+ * detects AbortError and re-enters idle state). When the user clicks Stop
+ * outside of a sendMessage flow (e.g. during confirmActionPlan), this
+ * function also force-clears the running flag.
+ */
+async function stopAgentRun(): Promise<void> {
+  const sessionIdToKill = state.pendingSessionId;
+  state.pendingSessionId = null;
+
+  // 1) Abort the in-flight fetch (and any pending /v1/chat/agent-continue
+  //    calls in the same loop). Safe to call even if the controller is null.
+  currentAbortController?.abort();
+
+  // 2) Best-effort server-side cleanup. Network failure here is non-fatal:
+  //    the local abort already breaks the loop, and the session will expire
+  //    after its 30-minute TTL if the server call fails.
+  if (sessionIdToKill) {
+    try {
+      await fetch(`${agentBase}/v1/chat/abort`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: sessionIdToKill }),
+      });
+    } catch {
+      // ignore — local abort is enough
     }
   }
 
-  return { reply: fullReply.trim(), actionPlan: donePayload.actionPlan ?? null, ...donePayload };
+  // 3) Force UI back to idle if sendMessage's catch/finally hasn't already
+  //    done so (e.g. user clicked Stop during confirmActionPlan).
+  setRunningState(false);
+  setStatus(chatStatus, "已停止生成");
 }
 
 // ─── Send Message ──────────────────────────────────────────────────────────
 
 async function sendMessage(): Promise<void> {
+  if (state.isAgentRunning) {
+    setStatus(chatStatus, "正在生成中，请先点 ⏹ 停止");
+    return;
+  }
+
   const text = userInput.value.trim();
   if (!text && !state.pendingAttachment) {
     setStatus(chatStatus, "请输入消息");
@@ -3078,6 +3391,8 @@ async function sendMessage(): Promise<void> {
     appendMessage("system", `已读取选区（${wordStructure.selection.text.length} 字）`);
   }
 
+  setRunningState(true);
+
   try {
     const assistantEl = createAssistantMessage("");
 
@@ -3093,7 +3408,7 @@ async function sendMessage(): Promise<void> {
       messagesForLlm.push({ role: "user", content: llmPrompt });
     }
 
-    const maxIter = Number($<HTMLInputElement>("maxIterations").value) || 10;
+    const maxIter = cachedProviderConfig?.maxIterations ?? (Number($<HTMLInputElement>("maxIterations").value) || 10);
     const data = useAgentLoop
       ? await sendAgentMessageStream(
           {
@@ -3154,8 +3469,17 @@ async function sendMessage(): Promise<void> {
 
     saveSessionsToStorage();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "未知错误";
-    setStatus(chatStatus, `请求失败: 无法连接本地 Agent (${message})`);
+    if (isAbortError(error)) {
+      // Aborted by user via ⏹ Stop. The server-side session was already
+      // removed by /v1/chat/abort, so no further tool calls will run.
+      setStatus(chatStatus, "已停止生成");
+      state.pendingSessionId = null;
+    } else {
+      const message = error instanceof Error ? error.message : "未知错误";
+      setStatus(chatStatus, `请求失败: 无法连接本地 Agent (${message})`);
+    }
+  } finally {
+    setRunningState(false);
   }
 }
 
@@ -3185,28 +3509,6 @@ async function retryLastMessage(): Promise<void> {
   // Set the input and send
   userInput.value = lastUserContent;
   await sendMessage();
-}
-
-// ─── Insert Last Reply ──────────────────────────────────────────────────────
-
-async function insertLastReplyToSelection(): Promise<void> {
-  if (!state.lastReply) {
-    setStatus(chatStatus, "没有可插入的回复");
-    return;
-  }
-
-  const cleanText = cleanupMarkdownForWord(state.lastReply);
-  showSimplePreview(cleanText, "replace");
-}
-
-async function insertLastReplyAtCursor(): Promise<void> {
-  if (!state.lastReply) {
-    setStatus(chatStatus, "没有可插入的回复");
-    return;
-  }
-
-  const cleanText = cleanupMarkdownForWord(state.lastReply);
-  showSimplePreview(cleanText, "insert_start");
 }
 
 // ─── Bind Actions ────────────────────────────────────────────────────────────
@@ -3287,6 +3589,11 @@ function bindActions(): void {
     void sendMessage();
   });
 
+  // Stop button: tear down any in-flight agent loop and clear server session.
+  $("stopBtn").addEventListener("click", () => {
+    void stopAgentRun();
+  });
+
   // Allow Enter to send (Shift+Enter for newline)
   userInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -3296,16 +3603,8 @@ function bindActions(): void {
   });
 
   // Insert actions
-  $("insertReply").addEventListener("click", () => {
-    void insertLastReplyToSelection();
-  });
-
   $("retryLast").addEventListener("click", () => {
     void retryLastMessage();
-  });
-
-  $("insertReplyCursor").addEventListener("click", () => {
-    void insertLastReplyAtCursor();
   });
 
   // Simple preview (legacy)

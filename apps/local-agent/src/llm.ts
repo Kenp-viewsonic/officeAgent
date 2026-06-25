@@ -401,6 +401,51 @@ export const WORD_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "insert_table",
+      description:
+        "在文档中插入一个真正的 Word 表格（不是 Markdown 表格语法）。当用户要求插入表格、对比表、列表矩阵等结构化内容时，必须使用本工具，而不是输出 Markdown 的 |---| 语法（Markdown 表格会原样插入到 Word 中无法阅读）。",
+      parameters: {
+        type: "object",
+        properties: {
+          location: {
+            type: "string",
+            enum: ["at_cursor", "at_end", "after_heading", "after_paragraph"],
+            description: "插入位置。at_cursor=当前光标或选区处；at_end=文档末尾；after_heading/after_paragraph 需要配合 heading_text 或 paragraph_index。",
+          },
+          heading_text: {
+            type: "string",
+            description: "location=after_heading 时使用：要插入到其后的标题文本。",
+          },
+          paragraph_index: {
+            type: "number",
+            description: "location=after_paragraph 时使用：目标段落序号（从 0 开始）。",
+          },
+          headers: {
+            type: "array",
+            items: { type: "string" },
+            description: "可选的表头行（第一行）。传空数组表示无表头，每行都是数据行。",
+          },
+          rows: {
+            type: "array",
+            items: {
+              type: "array",
+              items: { type: "string" },
+            },
+            description: "数据行，每个元素是一行（string[]）。短行会自动用空字符串补齐到与表头等宽。",
+          },
+          style: {
+            type: "string",
+            enum: ["TableGrid", "LightList", "MediumShading1", "NoBorders"],
+            description: "表格样式。默认 TableGrid（带边框）。",
+          },
+        },
+        required: ["location", "rows"],
+      },
+    },
+  },
 ];
 
 // --- Build document structure description ---
@@ -1149,8 +1194,9 @@ export function isPerceptionOnlyPlan(plan: ActionPlan): boolean {
 export function isIterablePlan(plan: ActionPlan): boolean {
   const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
   const iterableActionTools = [
-    "find_and_replace", "find_and_replace_v2", 
+    "find_and_replace", "find_and_replace_v2",
     "insert_at_cursor", "insert_after_heading", "insert_at_end", "insert_after_paragraph",
+    "insert_table",
     "delete_paragraph",
     "replace_paragraph", "set_paragraph_style", "merge_paragraphs", "apply_rich_format",
     "undo_last_action",
