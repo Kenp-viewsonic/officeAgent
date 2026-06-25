@@ -21,6 +21,10 @@ declare namespace Word {
     insertText(text: string, location: Word.InsertLocation): Word.Range;
     insertParagraph(paragraphText: string, insertLocation: Word.InsertLocation): Word.Paragraph;
     paragraphs: Word.ParagraphCollection;
+    /** Collection of all top-level tables in the document body.
+     *  Use `body.tables.items` to enumerate tables; `table.values` and
+     *  `table.rowCount`/`columnCount` to inspect contents. */
+    tables: Word.TableCollection;
   }
 
   interface Range {
@@ -40,6 +44,8 @@ declare namespace Word {
     search(searchText: string, options?: Word.SearchOptions): Word.SearchRangeCollection;
     paragraphs: Word.ParagraphCollection;
     getFirst(): Word.Range;
+    /** Deletes the range content from the document (WordApi 1.3+). */
+    delete(): void;
     /** Returns HTML representation of the range; access .value after context.sync() */
     getHtml(preferredFragmentOnly?: boolean): { value: string };
   }
@@ -49,8 +55,28 @@ declare namespace Word {
     /** Built-in style name (e.g. "TableGrid"). Setting this is the supported
      *  way to apply a built-in Word table style. */
     styleBuiltIn: string;
+    /** 2-D string matrix of cell contents. Each row is a string[], each
+     *  column a string. Empty cells appear as "". Must be .load()-ed and
+     *  context.sync()-ed before reading. */
     values: string[][];
+    /** Number of rows in the table (must be loaded). */
+    rowCount: number;
+    /** Number of columns in the table (must be loaded). */
+    columnCount: number;
+    /** Deletes the entire table from the document (WordApi 1.3+). */
+    delete(): void;
+    /** Returns the range that spans the whole table (body-level), useful for
+     *  re-locating the table inside the document. */
+    getRange(rangeLocation?: string): Word.Range;
+    /** Returns the parent body that owns this table (for table-level ops). */
     load(option: string | string[]): void;
+  }
+
+  interface TableCollection {
+    items: Word.Table[];
+    load(option: string | string[]): void;
+    getFirst(): Word.Table;
+    getLast(): Word.Table;
   }
 
   interface Font {

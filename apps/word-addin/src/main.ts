@@ -1322,11 +1322,60 @@ async function getStructuredContext(): Promise<DocumentStructure> {
       // Load paragraphs
       const paragraphs = body.paragraphs;
       paragraphs.load("items");
+      // Load tables in parallel so we can mark table-cell paragraphs as isTable=true.
+      const tables = body.tables;
+      tables.load("items");
       await context.sync();
 
       const paraList: DocumentParagraph[] = [];
       const MAX_PARAGRAPHS = 80;
       const MAX_TEXT_LENGTH = 200;
+
+      // Detect which body-paragraph indices are inside tables. Word JS exposes
+      // a table's content range via `table.getRange("Content")`; the paragraphs
+      // inside that range are exactly the table cells (including empty ones).
+      // We map the table's first cell text back to a body paragraph index,
+      // then assume table paragraphs are contiguous from there.
+      const tableParagraphIndices = new Set<number>();
+      const paragraphTableIndex = new Map<number, number>();
+      if (tables.items.length > 0) {
+        for (const table of tables.items) {
+          table.load(["rowCount", "columnCount"]);
+        }
+        await context.sync();
+
+        for (let tIdx = 0; tIdx < tables.items.length; tIdx++) {
+          const table = tables.items[tIdx];
+          try {
+            const tableRange = table.getRange("Content");
+            const tableParas = tableRange.paragraphs;
+            tableParas.load("items");
+            await context.sync();
+
+            if (tableParas.items.length === 0) continue;
+            tableParas.items[0].load("text");
+            await context.sync();
+
+            const firstText = (tableParas.items[0].text || "").trim();
+            let startIdx = -1;
+            for (let j = 0; j < paragraphs.items.length; j++) {
+              if ((paragraphs.items[j].text || "").trim() === firstText) {
+                startIdx = j;
+                break;
+              }
+            }
+            if (startIdx < 0) continue;
+
+            for (let j = 0; j < tableParas.items.length; j++) {
+              const idx = startIdx + j;
+              tableParagraphIndices.add(idx);
+              paragraphTableIndex.set(idx, tIdx);
+            }
+          } catch (e) {
+            console.warn(`[getStructuredContext] failed to map table ${tIdx}:`, e);
+          }
+        }
+      }
 
       for (let i = 0; i < Math.min(paragraphs.items.length, MAX_PARAGRAPHS); i++) {
         const p = paragraphs.items[i];
@@ -1350,12 +1399,14 @@ async function getStructuredContext(): Promise<DocumentStructure> {
         const fontBold = p.font.bold === true ? true : undefined;
         const fontItalic = p.font.italic === true ? true : undefined;
         const hasFont = fontName || fontSize || fontColor || fontBold || fontItalic;
+        const isInTable = tableParagraphIndices.has(i);
+        const tableMarker = isInTable ? ` [表格${paragraphTableIndex.get(i)}]` : "";
         paraList.push({
           index: i,
-          text: (imgCount > 0 && !text ? "（图片段落，无文字）" : text).slice(0, MAX_TEXT_LENGTH) + (imgCount > 0 ? ` [📷图片×${imgCount}]` : ""),
+          text: (imgCount > 0 && !text ? "（图片段落，无文字）" : text).slice(0, MAX_TEXT_LENGTH) + (imgCount > 0 ? ` [📷图片×${imgCount}]` : "") + tableMarker,
           style,
           headingLevel: headingMatch ? parseInt(headingMatch[1]) : undefined,
-          isTable: false,
+          isTable: isInTable,
           isList: p.isListItem,
           font: hasFont ? { name: fontName, size: fontSize, color: fontColor, bold: fontBold, italic: fontItalic } : undefined,
         });
@@ -1706,6 +1757,197 @@ async function getDocumentStats(): Promise<string> {
     };
 
     return JSON.stringify(stats, null, 2);
+  });
+}
+
+// ─── Table Perception Tools (Word Tables) ───────────────────────────────────
+
+/**
+ * List all top-level Word tables in the document body with their dimensions,
+ * style, and approximate paragraph-index span. Does NOT read cell contents
+ * — use read_table for that. The paragraph-index span helps the LLM locate
+ * each table when planning edits (e.g. "insert before the table").
+ *
+ * Why this exists: read_document returns every table cell as a separate
+ * paragraph, so the LLM cannot tell where one table ends and the next
+ * begins. This tool returns a clean structural overview instead.
+ */
+async function getDocumentTables(): Promise<string> {
+  if (typeof Word === "undefined") {
+    throw new Error("当前不在 Word 宿主中");
+  }
+
+  return Word.run(async (context) => {
+    const body = context.document.body;
+
+    const paragraphs = body.paragraphs;
+    paragraphs.load("items");
+    const tables = body.tables;
+    tables.load("items");
+    await context.sync();
+
+    if (tables.items.length === 0) {
+      return "文档中没有 Word 表格。";
+    }
+
+    // Load each table's dimensions and style.  columnCount may not be a
+    // loadable scalar in older Office.js hosts — fall back to values[0].length.
+    for (const table of tables.items) {
+      table.load(["rowCount", "columnCount", "styleBuiltIn", "values"]);
+    }
+    await context.sync();
+
+    // Build a paragraph-text index to map tables → paragraph spans
+    for (let i = 0; i < paragraphs.items.length; i++) {
+      paragraphs.items[i].load("text");
+    }
+    await context.sync();
+    const paragraphTexts: string[] = [];
+    for (let i = 0; i < paragraphs.items.length; i++) {
+      paragraphTexts.push((paragraphs.items[i].text || "").trim());
+    }
+
+    const tableInfos: Array<{
+      tableIndex: number;
+      rowCount: number;
+      columnCount: number;
+      style: string;
+      firstParagraphIndex?: number;
+      lastParagraphIndex?: number;
+      firstCellPreview?: string;
+    }> = [];
+
+    for (let i = 0; i < tables.items.length; i++) {
+      const table = tables.items[i];
+
+      let firstParagraphIndex: number | undefined;
+      let lastParagraphIndex: number | undefined;
+      let firstCellPreview: string | undefined;
+
+      try {
+        // Pull paragraphs that belong to this table via its content range
+        const tableRange = table.getRange("Content");
+        const tableParas = tableRange.paragraphs;
+        tableParas.load("items");
+        await context.sync();
+
+        if (tableParas.items.length > 0) {
+          tableParas.items[0].load("text");
+          const lastIdx = tableParas.items.length - 1;
+          if (lastIdx > 0) {
+            tableParas.items[lastIdx].load("text");
+          }
+          await context.sync();
+
+          const firstText = (tableParas.items[0].text || "").trim();
+          firstCellPreview = firstText.slice(0, 60);
+
+          // Map first paragraph → body paragraph index by text matching.
+          // The table's first cell text usually appears uniquely in the
+          // body paragraph sequence (cell texts are aggregated and pushed
+          // into body.paragraphs by Word JS). For ambiguous matches we
+          // pick the first occurrence — table paragraphs are contiguous.
+          for (let j = 0; j < paragraphTexts.length; j++) {
+            if (paragraphTexts[j] === firstText) {
+              firstParagraphIndex = j;
+              break;
+            }
+          }
+
+          if (lastIdx > 0) {
+            const lastText = (tableParas.items[lastIdx].text || "").trim();
+            // Walk backwards to find the last occurrence (most likely the
+            // table's last cell) — tables are contiguous in paragraph
+            // ordering so this is the cell's position.
+            for (let j = paragraphTexts.length - 1; j >= 0; j--) {
+              if (paragraphTexts[j] === lastText) {
+                lastParagraphIndex = j;
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[getDocumentTables] failed to map paragraph indices for table ${i}:`, e);
+      }
+
+      tableInfos.push({
+        tableIndex: i,
+        rowCount: table.rowCount,
+        columnCount: table.columnCount || (table.values?.[0]?.length ?? 0),
+        style: table.styleBuiltIn || "",
+        firstParagraphIndex,
+        lastParagraphIndex,
+        firstCellPreview,
+      });
+    }
+
+    const summary = tableInfos
+      .map((t) => {
+        const span =
+          t.firstParagraphIndex !== undefined && t.lastParagraphIndex !== undefined
+            ? `（位于段落 ${t.firstParagraphIndex} ~ ${t.lastParagraphIndex}）`
+            : "";
+        const preview = t.firstCellPreview ? `，首单元格："${t.firstCellPreview}"` : "";
+        return `  表格 ${t.tableIndex}：${t.rowCount} 行 × ${t.columnCount} 列，样式=${t.style || "(默认)"}${span}${preview}`;
+      })
+      .join("\n");
+
+    return `文档中共有 ${tables.items.length} 张表格：\n${summary}\n\n--- 结构化数据（便于精确引用） ---\n${JSON.stringify(tableInfos, null, 2)}`;
+  });
+}
+
+/**
+ * Read the full 2D content of a specific table. Returns both a human-readable
+ * row-by-row view and a JSON dump so the LLM can pick the format that fits
+ * the question being asked (e.g. "summarize the table" vs. "find cell at row 3").
+ */
+async function readTable(params: Record<string, any>): Promise<string> {
+  if (typeof Word === "undefined") {
+    throw new Error("当前不在 Word 宿主中");
+  }
+
+  const tableIndex = typeof params.table_index === "number" ? params.table_index : 0;
+
+  return Word.run(async (context) => {
+    const body = context.document.body;
+    const tables = body.tables;
+    tables.load("items");
+    await context.sync();
+
+    if (tableIndex < 0 || tableIndex >= tables.items.length) {
+      throw new Error(`表格序号 ${tableIndex} 越界（文档共有 ${tables.items.length} 张表格，序号范围 0 ~ ${tables.items.length - 1}）。请先调用 get_document_tables 确认有效索引。`);
+    }
+
+    const table = tables.items[tableIndex];
+    table.load(["values", "rowCount", "columnCount", "styleBuiltIn"]);
+    await context.sync();
+
+    const values: string[][] = Array.isArray(table.values) ? table.values : [];
+    const rowCount = table.rowCount || values.length;
+    const columnCount = table.columnCount || (values[0]?.length ?? 0);
+    const style = table.styleBuiltIn || "";
+
+    if (values.length === 0) {
+      return `表格 ${tableIndex}（${rowCount} 行 × ${columnCount} 列，样式: ${style || "(默认)"}）为空，没有可读取的单元格内容。`;
+    }
+
+    const lines: string[] = [];
+    lines.push(`表格 ${tableIndex}（${rowCount} 行 × ${columnCount} 列，样式: ${style || "(默认)"}）：`);
+
+    for (let r = 0; r < values.length; r++) {
+      const row = values[r] || [];
+      const cells = row.map((c, cIdx) => `[列${cIdx + 1}] ${c == null ? "" : String(c)}`);
+      lines.push(`[行${r + 1}] ${cells.join("  ")}`);
+    }
+
+    // Append JSON for unambiguous data extraction (e.g. when LLM needs
+    // to do regex or arithmetic on cell contents).
+    lines.push("");
+    lines.push("--- JSON 格式（便于精确解析）---");
+    lines.push(JSON.stringify({ tableIndex, rowCount, columnCount, style, values }, null, 2));
+
+    return lines.join("\n");
   });
 }
 
@@ -2200,6 +2442,16 @@ async function executeAction(action: WordAction): Promise<string> {
         return result;
       }
 
+      case "get_document_tables": {
+        const result = await getDocumentTables();
+        return result;
+      }
+
+      case "read_table": {
+        const result = await readTable(action.params);
+        return result;
+      }
+
       case "insert_at_cursor": {
         const { content, format = "normal", content_format = "text" } = action.params;
         if (!content || String(content).trim().length === 0) {
@@ -2376,6 +2628,27 @@ async function executeAction(action: WordAction): Promise<string> {
         (doc as any).undo(count);
         await context.sync();
         return `已撤销最近 ${count} 步操作`;
+      }
+
+      case "delete_table": {
+        const tableIndex = typeof action.params.table_index === "number" ? action.params.table_index : 0;
+        const tables = body.tables;
+        tables.load("items");
+        await context.sync();
+        if (tableIndex < 0 || tableIndex >= tables.items.length) {
+          throw new Error(`表格序号 ${tableIndex} 越界（文档共有 ${tables.items.length} 张表格，序号范围 0 ~ ${tables.items.length - 1}）。请先调用 get_document_tables 确认有效索引。`);
+        }
+        const targetTable = tables.items[tableIndex];
+        // WordApi 1.3+: table.delete() directly deletes the entire table.
+        // Fallback: delete via the table's body-level range.
+        try {
+          targetTable.delete();
+        } catch {
+          const range = targetTable.getRange("Whole");
+          range.delete();
+        }
+        await context.sync();
+        return `已删除表格 ${tableIndex}`;
       }
 
       case "insert_table": {
@@ -2904,7 +3177,7 @@ async function executeSingleTool(
 /** Tools that change paragraph indices (like iterator invalidation) */
 const STRUCTURE_MUTATING_TOOLS = new Set([
   "insert_after_paragraph", "insert_after_heading", "insert_at_start", "insert_at_end",
-  "insert_table",
+  "insert_table", "delete_table",
   "delete_paragraph", "merge_paragraphs", "undo_last_action",
 ]);
 
@@ -3009,7 +3282,7 @@ async function sendAgentMessageStream(
       if (event.type === "tool_call") {
         hasToolCall = true;
         for (const tool of event.tools) {
-          const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
+          const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format", "get_document_tables", "read_table"];
           if (!perceptionTools.includes(tool.tool)) {
             // Action tool in agent loop — treat as action_plan
             const plan: ActionPlan = {
@@ -3122,7 +3395,7 @@ async function continueAgentLoop(
     for (const event of events) {
       if (event.type === "tool_call") {
         hasToolCall = true;
-        const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
+        const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format", "get_document_tables", "read_table"];
         for (const tool of event.tools) {
           if (!perceptionTools.includes(tool.tool)) {
             const plan: ActionPlan = {

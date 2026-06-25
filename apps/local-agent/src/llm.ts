@@ -101,6 +101,31 @@ export const WORD_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "get_document_tables",
+      description: "获取文档中所有 Word 表格的概览信息（不读取单元格内容）。返回每张表格的：表格序号（从0开始）、行数、列数、表格样式、起始段落序号、结束段落序号。用于：快速了解文档里有几张表格、定位表格在文档中的位置、决定下一步要读取哪张表的内容。**不要用 read_document 读取表格内的单元格文本**——表格单元格会被 Word 当作独立段落返回，LLM 看到的只是平铺的单元格文本，无法理解行列结构；本工具配合 read_table 才能高效获取结构化表格数据。",
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_table",
+      description: "读取指定表格的完整 2D 结构化内容（所有单元格的文本）。**这是读取表格数据的正确方式**——调用 get_document_tables 拿到 table_index 后再用本工具。返回内容按行/列格式化输出（每行形如 `[行N] 单元格1 | 单元格2 | ...`），便于 LLM 一次性理解整张表的结构。如果表格很大（>20 行），建议在结果中重点摘要用户关心的部分。",
+      parameters: {
+        type: "object",
+        properties: {
+          table_index: { type: "number", description: "表格序号（从0开始）。先调用 get_document_tables 确认索引范围。" },
+        },
+        required: ["table_index"],
+      },
+    },
+  },
 
   // --- 操作类工具 (Action) ---
   {
@@ -404,6 +429,20 @@ export const WORD_TOOLS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "delete_table",
+      description: "删除文档中指定的一张 Word 表格。先调用 get_document_tables 获取表格序号，再调用本工具删除。删除是不可逆的（但可用 undo_last_action 回退），建议删除前先调用 read_table 确认表格内容。",
+      parameters: {
+        type: "object",
+        properties: {
+          table_index: { type: "number", description: "要删除的表格序号（从0开始）。先调用 get_document_tables 确认索引。" },
+        },
+        required: ["table_index"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "insert_table",
       description:
         "在文档中插入一个真正的 Word 表格（不是 Markdown 表格语法）。当用户要求插入表格、对比表、列表矩阵等结构化内容时，必须使用本工具，而不是输出 Markdown 的 |---| 语法（Markdown 表格会原样插入到 Word 中无法阅读）。",
@@ -464,21 +503,27 @@ function describeFontBrief(font?: { name?: string; size?: number; color?: string
 export function describeDocumentStructure(structure: {
   totalParagraphs: number;
   totalCharacters?: number;
-  paragraphs: Array<{ index: number; text: string; style: string; headingLevel?: number; isList: boolean; charCount?: number; font?: { name?: string; size?: number; color?: string; bold?: boolean; italic?: boolean } }>;
+  paragraphs: Array<{ index: number; text: string; style: string; headingLevel?: number; isTable?: boolean; isList: boolean; charCount?: number; font?: { name?: string; size?: number; color?: string; bold?: boolean; italic?: boolean } }>;
   selection: { text: string; startParagraphIndex?: number; endParagraphIndex?: number };
 }): string {
   const lines: string[] = [];
   lines.push(`文档共 ${structure.totalParagraphs} 段${structure.totalCharacters ? `，约 ${structure.totalCharacters} 字符` : ""}。结构概览：`);
+  // Count tables so we can surface a hint up front.
+  const tableParaCount = structure.paragraphs.filter((p) => p.isTable).length;
+  if (tableParaCount > 0) {
+    lines.push(`（注意：${tableParaCount} 个段落属于 Word 表格内的单元格。如需查看表格结构化数据，请使用 get_document_tables + read_table 工具，不要用 read_document 逐个读单元格文本。）`);
+  }
 
   for (const p of structure.paragraphs) {
     const charInfo = p.charCount ? `(${p.charCount}字)` : "";
     const fontInfo = describeFontBrief(p.font);
+    const tableMark = p.isTable ? "[TBL] " : "";
     if (p.headingLevel) {
-      lines.push(`  ${"#".repeat(p.headingLevel)} [段落${p.index}]${charInfo}${fontInfo} ${p.text}`);
+      lines.push(`  ${"#".repeat(p.headingLevel)} [段落${p.index}]${charInfo}${fontInfo} ${tableMark}${p.text}`);
     } else if (p.isList) {
-      lines.push(`  - [段落${p.index}]${charInfo}${fontInfo} ${p.text}`);
+      lines.push(`  - [段落${p.index}]${charInfo}${fontInfo} ${tableMark}${p.text}`);
     } else {
-      lines.push(`  [段落${p.index}]${charInfo}${fontInfo} ${p.text.slice(0, 100)}`);
+      lines.push(`  [段落${p.index}]${charInfo}${fontInfo} ${tableMark}${p.text.slice(0, 100)}`);
     }
   }
 
@@ -528,7 +573,8 @@ function buildSystemPrompt(
 - 插入/删除操作后段落索引会变化，后续操作应基于新的索引
 - 如果 find_and_replace_v2 返回 replaced=0，说明查找失败，不要继续基于该假设执行后续操作
 - content 参数必须是非空字符串
-- 注意：段落级别字体信息只是该段落的默认/主字体。Word 文档支持在同一段落内对不同文字片段设置不同格式（内联格式），如需精确了解段落内的格式分布（例如某段落中部分文字加粗、部分使用不同字体），请使用 get_paragraph_format 工具获取逐片段的格式详情`;
+- 注意：段落级别字体信息只是该段落的默认/主字体。Word 文档支持在同一段落内对不同文字片段设置不同格式（内联格式），如需精确了解段落内的格式分布（例如某段落中部分文字加粗、部分使用不同字体），请使用 get_paragraph_format 工具获取逐片段的格式详情
+- 涉及 Word 表格的读取时**必须**使用 get_document_tables + read_table；不要用 read_document 读表格里的单元格文本——单元格会被 Word 当作独立段落平铺返回，LLM 无法看到行列结构`;
 
   if (hasTools) {
     content += "\n\n## 可用工具清单\n\n你有以下工具可以调用。每个工具都有明确的适用场景，请根据用户意图选择最合适的工具。\n";
@@ -563,6 +609,24 @@ function buildSystemPrompt(
     content += "| paragraph_index | number | 是 | 要查看的段落序号（从 0 开始） |\n\n";
     content += "返回值解读：\n- runs 只有 1 个 → 全段格式统一\n- runs 有多个 → 段落内存在格式变化（部分加粗、不同字体等）\n\n";
     content += "使用场景：需要精确了解段落内格式分布 | 判断是否需要修改内联格式\n\n";
+    content += "---\n\n";
+    content += "#### 'get_document_tables'\n";
+    content += "获取文档中所有 Word 表格的**概览信息**（不读取单元格内容）。**无参数**，返回每张表格的：表格序号、行数、列数、表格样式、起始段落序号、结束段落序号。\n\n";
+    content += "**重要**：不要用 read_document 读取表格内的单元格文本——Word 会把每个单元格当成独立段落返回，LLM 看到的只是平铺的单元格文本，无法理解行列结构。读取表格请用本工具 + read_table。\n\n";
+    content += "使用场景：发现文档里有几张表格 | 定位表格在文档中的位置 | 决定下一步读哪张表\n\n";
+    content += "---\n\n";
+    content += "#### 'read_table'\n";
+    content += "读取指定表格的**完整 2D 结构化内容**（所有单元格的文本）。这是读取表格数据的正确方式。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| table_index | number | 是 | 表格序号（从 0 开始）。先调用 get_document_tables 确认索引 |\n\n";
+    content += "返回格式：每行形如 `[行N] 单元格1 | 单元格2 | ...`。\n\n";
+    content += "使用场景：查看整张表的内容 | 摘要表格数据 | 基于表格内容做修改决策\n\n";
+    content += "---\n\n";
+    content += "#### 'delete_table'\n";
+    content += "删除文档中指定的一张 Word 表格。删除不可逆（但可用 undo_last_action 回退），**建议删除前先用 read_table 确认表格内容**。\n\n";
+    content += "| 参数 | 类型 | 必填 | 说明 |\n|------|------|------|------|\n";
+    content += "| table_index | number | 是 | 要删除的表格序号（从 0 开始）。先调用 get_document_tables 确认 |\n\n";
+    content += "使用场景：删除废弃/重复表格 | 按指令清理文档中的表格\n\n";
     content += "---\n\n";
     content += "### 操作类工具 — 安全可自动迭代\n\n";
     content += "> 以下工具可在 Agent 循环中自动执行（无需用户确认），建议操作后用 read_document 验证结果。\n\n";
@@ -698,9 +762,9 @@ function buildSystemPrompt(
     content += "## 自我迭代工作流\n\n";
     content += "你可以在一个 Agent 循环中完成 感知 → 操作 → 验证 → 结束 的完整流程：\n\n";
     content += "| 步骤 | 做什么 | 用什么工具 |\n|------|--------|-----------|\n";
-    content += "| 1. 感知 | 了解文档现状 | read_document、get_document_stats、get_selection_info |\n";
+    content += "| 1. 感知 | 了解文档现状 | read_document、get_document_stats、get_selection_info、get_document_tables、read_table |\n";
     content += "| 2. 操作 | 执行修改 | insert_at_cursor、find_and_replace_v2、replace_paragraph 等 |\n";
-    content += "| 3. 验证 | 确认修改结果 | read_document、get_selection_info |\n";
+    content += "| 3. 验证 | 确认修改结果 | read_document、get_selection_info、read_table |\n";
     content += "| 4. 修正 | 不满足预期则继续调整 | 回到步骤 2 |\n";
     content += "| 5. 结束 | **验证通过后**标记任务完成 | task_complete |\n\n";
     content += "**示例**：用户说「把所有'旧名称'换成'新名称'」\n";
@@ -1187,16 +1251,16 @@ export async function callOpenAICompatible(
 
 // Helper to check if an action plan contains only perception tools
 export function isPerceptionOnlyPlan(plan: ActionPlan): boolean {
-  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
+  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format", "get_document_tables", "read_table"];
   return plan.actions.length > 0 && plan.actions.every((a) => perceptionTools.includes(a.action));
 }
 
 export function isIterablePlan(plan: ActionPlan): boolean {
-  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format"];
+  const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format", "get_document_tables", "read_table"];
   const iterableActionTools = [
     "find_and_replace", "find_and_replace_v2",
     "insert_at_cursor", "insert_after_heading", "insert_at_end", "insert_after_paragraph",
-    "insert_table",
+    "insert_table", "delete_table",
     "delete_paragraph",
     "replace_paragraph", "set_paragraph_style", "merge_paragraphs", "apply_rich_format",
     "undo_last_action",
