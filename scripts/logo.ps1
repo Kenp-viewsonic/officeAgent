@@ -26,7 +26,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # Resolve package.json (works for both source scripts/ and packaged dist/)
 # ---------------------------------------------------------------------------
 $pkgPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\package.json'))
-$version = '0.1.0'
+$version = '1.2.0'
 $name    = 'Office Agent'
 if (Test-Path $pkgPath) {
     try {
