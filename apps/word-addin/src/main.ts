@@ -2192,6 +2192,62 @@ async function insertMultiParagraphAtStart(
   return firstInserted!;
 }
 
+// ─── Mermaid Rendering ──────────────────────────────────────────────────────
+
+let mermaidLib: typeof import("mermaid").default | null = null;
+let mermaidRenderSeq = 0;
+
+async function getMermaid(): Promise<typeof import("mermaid").default> {
+  if (mermaidLib) return mermaidLib;
+  const mod = await import("mermaid");
+  mermaidLib = mod.default;
+  mermaidLib.initialize({ startOnLoad: false, securityLevel: "strict", htmlLabels: false });
+  return mermaidLib;
+}
+
+/**
+ * Render mermaid source → SVG → Canvas raster → PNG base64.
+ * htmlLabels:false avoids foreignObject, which would taint Canvas.
+ */
+async function renderMermaidImage(code: string): Promise<string> {
+  const mermaid = await getMermaid();
+  const id = `mermaid-render-${++mermaidRenderSeq}`;
+  const { svg } = await mermaid.render(id, code);
+
+  // Parse viewBox to get the real rendering dimensions, then rasterize at
+  // a target width of 800 px (DPR-aware).  The default SVG from mermaid
+  // often has no explicit width/height, so img.width returns ~0.
+  const vb = svg.match(/viewBox="([^"]+)"/)?.[1];
+  const parts = vb?.split(/\s+/).map(Number);
+  const vbW = parts && parts.length >= 3 ? parts[2] : 0;
+  const vbH = parts && parts.length >= 4 ? parts[3] : 0;
+  const naturalW = vbW > 0 ? vbW : 800;
+  const naturalH = vbH > 0 ? vbH : 600;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const targetW = Math.round(800 * dpr);
+  const targetH = Math.round((naturalH / naturalW) * 800 * dpr);
+
+  const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("mermaid SVG 栅格化失败"));
+      img.src = url;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, targetW);
+    canvas.height = Math.max(1, targetH);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas 2d context 不可用");
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+    return canvas.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function executeAction(action: WordAction): Promise<string> {
   if (typeof Word === "undefined") {
     throw new Error("当前不在 Word 宿主中");
@@ -2775,6 +2831,60 @@ async function executeAction(action: WordAction): Promise<string> {
         return `已在光标处插入 ${rowCount} × ${colCount} 表格`;
       }
 
+      case "insert_mermaid_image": {
+        const {
+          mermaid_code,
+          location = "at_cursor",
+          heading_text,
+          paragraph_index,
+        } = action.params as {
+          mermaid_code: string;
+          location?: "at_cursor" | "at_end" | "after_heading" | "after_paragraph";
+          heading_text?: string;
+          paragraph_index?: number;
+        };
+        if (!mermaid_code || String(mermaid_code).trim().length === 0) {
+          throw new Error("mermaid_code 不能为空");
+        }
+
+        // Render to PNG data URL (mermaid only touches the browser DOM).
+        const dataUrl = await renderMermaidImage(String(mermaid_code));
+
+        let target: Word.Range;
+        let locationDesc: string;
+        if (location === "after_heading") {
+          if (!heading_text) throw new Error("location=after_heading 时必须提供 heading_text");
+          const matches = body.search(heading_text, { matchCase: false, matchWholeWord: false });
+          matches.load("items");
+          await context.sync();
+          if (matches.items.length === 0) throw new Error(`未找到标题 "${heading_text}"`);
+          target = matches.items[0].paragraphs.getFirst().getRange("End");
+          locationDesc = `标题 "${heading_text}" 后`;
+        } else if (location === "after_paragraph") {
+          if (typeof paragraph_index !== "number") {
+            throw new Error("location=after_paragraph 时必须提供 paragraph_index");
+          }
+          const paragraphs = body.paragraphs;
+          paragraphs.load("items");
+          await context.sync();
+          if (paragraph_index < 0 || paragraph_index >= paragraphs.items.length) {
+            throw new Error(`paragraph_index ${paragraph_index} 越界（共 ${paragraphs.items.length} 段）`);
+          }
+          target = paragraphs.items[paragraph_index].getRange("End");
+          locationDesc = `段落 ${paragraph_index} 后`;
+        } else if (location === "at_end") {
+          target = body.paragraphs.getLast().getRange("End");
+          locationDesc = "文档末尾";
+        } else {
+          target = context.document.getSelection().getRange("End");
+          locationDesc = "光标处";
+        }
+
+        target.insertInlinePictureFromBase64(dataUrl, "After");
+        await context.sync();
+        return `已在${locationDesc}插入流程图`;
+      }
+
       default:
         return `未知操作: ${action.action}`;
     }
@@ -3178,6 +3288,7 @@ async function executeSingleTool(
 const STRUCTURE_MUTATING_TOOLS = new Set([
   "insert_after_paragraph", "insert_after_heading", "insert_at_start", "insert_at_end",
   "insert_table", "delete_table",
+  "insert_mermaid_image",
   "delete_paragraph", "merge_paragraphs", "undo_last_action",
 ]);
 

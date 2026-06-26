@@ -485,6 +485,36 @@ export const WORD_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "insert_mermaid_image",
+      description: "用 mermaid 语法生成流程图/时序图/类图等并以图片插入 Word。支持 flowchart / sequenceDiagram / classDiagram / stateDiagram / erDiagram / gantt / pie / gitGraph / journey / C4 等所有 mermaid 语法。渲染失败时错误会原样回传，请修正语法后重试。",
+      parameters: {
+        type: "object",
+        properties: {
+          mermaid_code: {
+            type: "string",
+            description: "mermaid 源代码（以 `graph`/`flowchart`/`sequenceDiagram` 等关键字开头）。",
+          },
+          location: {
+            type: "string",
+            enum: ["at_cursor", "at_end", "after_heading", "after_paragraph"],
+            description: "插入位置。at_cursor=当前光标或选区处（默认）；at_end=文档末尾；after_heading/after_paragraph 需配合 heading_text 或 paragraph_index。",
+          },
+          heading_text: {
+            type: "string",
+            description: "location=after_heading 时使用：要插入到其后的标题文本。",
+          },
+          paragraph_index: {
+            type: "number",
+            description: "location=after_paragraph 时使用：目标段落序号（从 0 开始）。",
+          },
+        },
+        required: ["mermaid_code"],
+      },
+    },
+  },
 ];
 
 // --- Build document structure description ---
@@ -1075,6 +1105,8 @@ function describeAction(actionName: string, params: Record<string, any>): string
       return `任务完成：${params.summary || ""}`;
     case "undo_last_action":
       return `撤销最近 ${params.count || 1} 步操作`;
+    case "insert_mermaid_image":
+      return `在文档中插入 mermaid 流程图（位置: ${params.location ?? "at_cursor"}）`;
     default:
       return `${actionName}: ${JSON.stringify(params)}`;
   }
@@ -1261,6 +1293,7 @@ export function isIterablePlan(plan: ActionPlan): boolean {
     "find_and_replace", "find_and_replace_v2",
     "insert_at_cursor", "insert_after_heading", "insert_at_end", "insert_after_paragraph",
     "insert_table", "delete_table",
+    "insert_mermaid_image",
     "delete_paragraph",
     "replace_paragraph", "set_paragraph_style", "merge_paragraphs", "apply_rich_format",
     "undo_last_action",
