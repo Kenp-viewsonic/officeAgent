@@ -3,6 +3,7 @@ import { logRequestStart, logResponseRaw, logResponseParsed, logError } from "./
 
 type ChatCompletionResponse = {
   choices?: Array<{
+    finish_reason?: string;
     message?: {
       content?: string;
       reasoning_content?: string;
@@ -19,7 +20,12 @@ type ChatCompletionResponse = {
 };
 
 type StreamChunk = {
-  choices?: Array<{ delta?: { content?: string; reasoning_content?: string; tool_calls?: any }; text?: string; message?: { content?: string } }>;
+  choices?: Array<{
+    finish_reason?: string;
+    delta?: { content?: string; reasoning_content?: string; tool_calls?: any };
+    text?: string;
+    message?: { content?: string };
+  }>;
 };
 
 type ModelsResponse = {
@@ -920,7 +926,7 @@ function buildPayload(
     model: config.model,
     messages: [systemPrompt, ...sanitized, trailingSystem],
     temperature: config.temperature ?? 0.2,
-    max_tokens: config.maxTokens ?? 900,
+    max_tokens: config.maxTokens ?? 4096,
     stream,
   };
 
@@ -1194,7 +1200,7 @@ export async function callOpenAICompatible(
   insertMode?: string,
   documentStructureDescription?: string,
   dynamicContext?: { documentContext?: string; selection?: string }
-): Promise<{ reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
+): Promise<{ reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; finishReason?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
   const payload = buildPayload(config, messages, contextChunks, false, tools, insertMode, documentStructureDescription, dynamicContext);
   const endpoint = getEndpoint(config);
   const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 180_000);
@@ -1262,6 +1268,7 @@ export async function callOpenAICompatible(
   }
 
   const reasoningContent = message.reasoning_content || undefined;
+  const finishReason = choice?.finish_reason;
 
   // Check for tool_calls
   if (message.tool_calls && message.tool_calls.length > 0) {
@@ -1269,7 +1276,7 @@ export async function callOpenAICompatible(
     // If there's also text content, include it as the reply
     const reply = message.content?.trim() || actionPlan.explanation;
     await logResponseParsed(traceId, { reply, actionPlan, toolCalls: message.tool_calls });
-    return { reply, actionPlan, reasoningContent, toolCalls: message.tool_calls };
+    return { reply, actionPlan, reasoningContent, finishReason, toolCalls: message.tool_calls };
   }
 
   // No tool_calls — check for text-based action plan (fallback)
@@ -1278,7 +1285,7 @@ export async function callOpenAICompatible(
   const reply = textActionPlan ? extractTextReply(textContent) || textActionPlan.explanation : textContent;
 
   await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
-  return { reply, actionPlan: textActionPlan, reasoningContent };
+  return { reply, actionPlan: textActionPlan, reasoningContent, finishReason };
 }
 
 // Helper to check if an action plan contains only perception tools
@@ -1312,7 +1319,7 @@ export async function streamOpenAICompatible(
   insertMode?: string,
   documentStructureDescription?: string,
   dynamicContext?: { documentContext?: string; selection?: string }
-): Promise<{ reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
+): Promise<{ reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; finishReason?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
   const payload = buildPayload(config, messages, contextChunks, true, tools, insertMode, documentStructureDescription, dynamicContext);
   const endpoint = getEndpoint(config);
   const overallTimeoutMs = config.overallTimeout ? config.overallTimeout * 1000 : Number(process.env.LLM_STREAM_TIMEOUT_MS ?? 240_000);
@@ -1432,6 +1439,7 @@ export async function streamOpenAICompatible(
     }
 
     const reasoningContent = message.reasoning_content || undefined;
+    const finishReason = choice?.finish_reason;
 
     // Check for tool_calls in non-streaming JSON response
     if (message.tool_calls && message.tool_calls.length > 0) {
@@ -1441,7 +1449,7 @@ export async function streamOpenAICompatible(
         onDelta(reply);
       }
       await logResponseParsed(traceId, { reply, actionPlan, toolCalls: message.tool_calls });
-      return { reply, actionPlan, reasoningContent, toolCalls: message.tool_calls };
+      return { reply, actionPlan, reasoningContent, finishReason, toolCalls: message.tool_calls };
     }
 
     const textContent = message.content?.trim() || "模型没有返回可用内容。";
@@ -1451,7 +1459,7 @@ export async function streamOpenAICompatible(
       onDelta(textContent);
     }
     await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
-    return { reply, actionPlan: textActionPlan, reasoningContent };
+    return { reply, actionPlan: textActionPlan, reasoningContent, finishReason };
   }
 
   if (!response.body) {
@@ -1468,6 +1476,7 @@ export async function streamOpenAICompatible(
   let buffer = "";
   let fullText = "";
   let fullReasoning = "";
+  let lastFinishReason: string | undefined;
   let pendingToolCalls: Map<number, { id: string; name: string; arguments: string }> = new Map();
 
   while (true) {
@@ -1498,6 +1507,12 @@ export async function streamOpenAICompatible(
         continue;
       }
 
+      // Capture finish_reason from the choice — OpenAI sends it on the final chunk
+      const choiceFinishReason = parsed.choices?.[0]?.finish_reason;
+      if (choiceFinishReason) {
+        lastFinishReason = choiceFinishReason;
+      }
+
       const delta = parsed.choices?.[0]?.delta;
       if (!delta) {
         // Try legacy format
@@ -1513,8 +1528,17 @@ export async function streamOpenAICompatible(
         continue;
       }
 
+      // Helper to mark first token received (any non-empty delta counts)
+      const markFirstToken = () => {
+        if (!firstTokenReceived) {
+          firstTokenReceived = true;
+          clearTimeout(firstTokenTimer);
+        }
+      };
+
       // Handle tool_calls in streaming
       if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+        markFirstToken();
         for (const tc of delta.tool_calls as Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>) {
           const idx = tc.index ?? 0;
           const existing = pendingToolCalls.get(idx);
@@ -1541,16 +1565,14 @@ export async function streamOpenAICompatible(
       // Handle reasoning content (thinking chain in streaming mode)
       const reasoning = delta.reasoning_content ?? "";
       if (reasoning) {
+        markFirstToken();
         fullReasoning += reasoning;
       }
 
       // Handle text content
       const content = delta.content ?? "";
       if (content) {
-        if (!firstTokenReceived) {
-          firstTokenReceived = true;
-          clearTimeout(firstTokenTimer);
-        }
+        markFirstToken();
         fullText += content;
         onDelta(content);
       }
@@ -1563,7 +1585,7 @@ export async function streamOpenAICompatible(
     signal.removeEventListener("abort", externalAbortHandler);
   }
 
-  await logResponseRaw(traceId, { status: response.status, contentType, streamChunkCount: pendingToolCalls.size });
+  await logResponseRaw(traceId, { status: response.status, contentType, streamChunkCount: pendingToolCalls.size, fullTextLength: fullText.length, fullReasoningLength: fullReasoning.length });
 
   // Process accumulated tool calls
   if (pendingToolCalls.size > 0) {
@@ -1581,12 +1603,15 @@ export async function streamOpenAICompatible(
     const actionPlan = parseActionPlanFromToolCalls(toolCalls);
     const reply = fullText.trim() || actionPlan.explanation;
     await logResponseParsed(traceId, { reply, actionPlan, toolCalls });
-    return { reply, actionPlan, reasoningContent: fullReasoning || undefined, toolCalls };
+    return { reply, actionPlan, reasoningContent: fullReasoning || undefined, finishReason: lastFinishReason, toolCalls };
   }
 
-  // No tool calls — check for text-based action plan
+  // No tool calls — check for text-based action plan.
+  // reasoning_content is internal monologue (DeepSeek, Agnes, etc.); never
+  // used as the user-facing reply.  The loop decision is driven by
+  // finish_reason, not by whether reasoning_content is present.
   const textActionPlan = parseActionPlanFromText(fullText);
   const reply = textActionPlan ? extractTextReply(fullText) || textActionPlan.explanation : fullText.trim() || "模型没有返回可用内容。";
   await logResponseParsed(traceId, { reply, actionPlan: textActionPlan });
-  return { reply, actionPlan: textActionPlan, reasoningContent: fullReasoning || undefined };
+  return { reply, actionPlan: textActionPlan, reasoningContent: fullReasoning || undefined, finishReason: lastFinishReason };
 }

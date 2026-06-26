@@ -5,11 +5,12 @@ title Office Agent Local
 set "PORT=8787"
 set "URL=http://127.0.0.1:%PORT%"
 
-echo.
-echo  '╔══════════════════════════════════════╗'
-echo  '║     Office Agent Local v0.1.0        ║'
-echo  '╚══════════════════════════════════════╝'
-echo.
+REM ── 打印 Logo / Banner ───────────────────────
+powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0logo.ps1" 2>nul
+if errorlevel 1 (
+    echo  Office Agent Local v0.1.0
+    echo.
+)
 
 REM ── 检查端口是否已被占用 ──────────────────────
 echo  Checking port %PORT%...

@@ -5,7 +5,8 @@ import path from "node:path";
 import mammoth from "mammoth";
 import { z } from "zod";
 import { createSession, getSession, appendToSession, deleteSession } from "./agent-session.js";
-import { callOpenAICompatible, describeDocumentStructure, isPerceptionOnlyPlan, isIterablePlan, listOpenAICompatibleModels, LlmHttpError, parseActionPlanFromToolCalls, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
+import { callOpenAICompatible, describeDocumentStructure, listOpenAICompatibleModels, LlmHttpError, parseActionPlanFromToolCalls, streamOpenAICompatible, WORD_TOOLS } from "./llm.js";
+import { executeTurn, buildAssistantMessage, detectDoomLoop, fingerprintToolCall, classifyToolCalls, TurnResult } from "./tool-runtime.js";
 import { keywordRetrieve, splitToChunks } from "./retrieval.js";
 import { appendChunks, clearAllChunks, deleteChunksByFile, getKbFileList, getKbStats, importChunks, loadChunks, loadProviderConfig, saveProviderConfig, loadPresets, savePreset, deletePreset } from "./store.js";
 import { ActionPlan, ChatMessage, DocumentStructure, ProviderConfig, ConfigPreset, RetrievalChunk } from "./types.js";
@@ -568,66 +569,109 @@ async function runAgentIteration(
   onEvent: (event: any) => void,
   signal: AbortSignal,
   iteration: number,
-  traceId: string
-): Promise<{ reply: string; actionPlan: ActionPlan | null; done: boolean; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
-  const result = await streamOpenAICompatible(
+  traceId: string,
+  maxTokensOverride?: number,
+): Promise<{ reply: string; actionPlan: ActionPlan | null; done: boolean; doneReason?: string; reasoningContent?: string; finishReason?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }> {
+  const turn = await executeTurn({
     provider,
     messages,
     retrieved,
-    (delta) => {
-      onEvent({ type: "delta", delta });
-    },
-    signal,
-    WORD_TOOLS,
+    tools: WORD_TOOLS,
     insertMode,
     documentStructureDescription,
-    dynamicContext
-  );
+    dynamicContext,
+    signal,
+    onDelta: (delta) => onEvent({ type: "delta", delta }),
+    maxTokensOverride,
+    turnNumber: iteration,
+  });
 
-  // If LLM returned tool calls
-  if (result.toolCalls && result.toolCalls.length > 0) {
-    const actionPlan = parseActionPlanFromToolCalls(result.toolCalls);
-
-    // Log each tool call issued
-    for (const tc of result.toolCalls) {
+  // Log each tool call issued (for any turn that had them).
+  if (turn.toolCalls) {
+    for (const tc of turn.toolCalls) {
       const params = safeParseToolArgs(tc.function.arguments);
       await logToolCall(undefined, { iteration, toolCallId: tc.id, toolName: tc.function.name, params });
     }
-
-    // Check if task_complete is called — stop the loop
-    const taskCompleteCall = result.toolCalls.find((tc) => tc.function.name === "task_complete");
-    if (taskCompleteCall) {
-      let summary = "任务已完成";
-      const taskArgs = safeParseToolArgs(taskCompleteCall.function.arguments);
-      summary = taskArgs.summary || summary;
-      onEvent({ type: "task_complete", summary });
-      await logIterationEnd(traceId, { iteration, done: true, reason: `task_complete: ${summary}` });
-      return { reply: summary, actionPlan: null, done: true, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
-    }
-
-    // Check if all tool calls are perception-only
-    if (isPerceptionOnlyPlan(actionPlan)) {
-      onEvent({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
-      await logIterationEnd(traceId, { iteration, done: false, reason: "perception_only_plan" });
-      return { reply: result.reply, actionPlan, done: false, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
-    }
-
-    // Check if tool calls are iterable (perception + safe action tools) - continue loop
-    if (isIterablePlan(actionPlan)) {
-      onEvent({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) });
-      await logIterationEnd(traceId, { iteration, done: false, reason: "iterable_plan" });
-      return { reply: result.reply, actionPlan, done: false, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
-    }
-
-    // Mixed or action-only: send action_plan event and finish
-    onEvent({ type: "action_plan", plan: actionPlan });
-    await logIterationEnd(traceId, { iteration, done: true, reason: "action_plan" });
-    return { reply: result.reply, actionPlan, done: true, reasoningContent: result.reasoningContent, toolCalls: result.toolCalls };
   }
 
-  // No tool calls — final reply
-  await logIterationEnd(traceId, { iteration, done: true, reason: "final_reply" });
-  return { reply: result.reply, actionPlan: result.actionPlan, done: true, reasoningContent: result.reasoningContent };
+  switch (turn.doneReason) {
+    case "task_complete": {
+      const summary = turn.taskCompleteSummary || "任务已完成";
+      onEvent({ type: "task_complete", summary });
+      await logIterationEnd(traceId, { iteration, done: true, reason: `task_complete: ${summary}` });
+      return {
+        reply: summary,
+        actionPlan: null,
+        done: true,
+        doneReason: turn.doneReason,
+        reasoningContent: turn.reasoningContent,
+        finishReason: turn.finishReason,
+        toolCalls: turn.toolCalls,
+      };
+    }
+    case "tool_calls_pending": {
+      const tcs = turn.toolCalls || [];
+      const classification = classifyToolCalls(tcs);
+      onEvent({
+        type: "tool_call",
+        tools: tcs.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })),
+        classification,
+      });
+      await logIterationEnd(traceId, { iteration, done: false, reason: "tool_calls_pending" });
+      return {
+        reply: turn.reply,
+        actionPlan: turn.actionPlan,
+        done: false,
+        doneReason: turn.doneReason,
+        reasoningContent: turn.reasoningContent,
+        finishReason: turn.finishReason,
+        toolCalls: tcs,
+      };
+    }
+    case "length_truncated": {
+      // Surface as a server-side info event so the trace records the bump.
+      onEvent({ type: "length_truncated", nextMaxTokens: turn.nextMaxTokens });
+      await logIterationEnd(traceId, { iteration, done: false, reason: `length_truncated; bumped to maxTokens=${turn.nextMaxTokens}` });
+      return {
+        reply: turn.reply,
+        actionPlan: null,
+        done: false,
+        doneReason: turn.doneReason,
+        reasoningContent: turn.reasoningContent,
+        finishReason: turn.finishReason,
+        toolCalls: undefined,
+      };
+    }
+    case "no_content": {
+      await logIterationEnd(traceId, { iteration, done: true, reason: "no_content" });
+      return {
+        reply: turn.reply || "模型没有返回可用内容。",
+        actionPlan: null,
+        done: true,
+        doneReason: turn.doneReason,
+        reasoningContent: turn.reasoningContent,
+        finishReason: turn.finishReason,
+        toolCalls: undefined,
+      };
+    }
+    case "error": {
+      await logIterationEnd(traceId, { iteration, done: true, reason: `error: ${turn.error ?? "unknown"}` });
+      throw new Error(turn.error || "LLM error");
+    }
+    case "final_reply":
+    default: {
+      await logIterationEnd(traceId, { iteration, done: true, reason: "final_reply" });
+      return {
+        reply: turn.reply,
+        actionPlan: turn.actionPlan,
+        done: true,
+        doneReason: turn.doneReason,
+        reasoningContent: turn.reasoningContent,
+        finishReason: turn.finishReason,
+        toolCalls: undefined,
+      };
+    }
+  }
 }
 
 app.post("/v1/chat/agent-stream", async (req, res) => {
@@ -683,11 +727,13 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
     let finalReply = "";
     let finalActionPlan: ActionPlan | null = null;
     let iteration = 0;
+    let currentMaxTokensOverride: number | undefined = undefined;
+    const recentToolFingerprints: string[] = [];
 
     while (iteration < maxIterations) {
       iteration++;
 
-      let iterationResult: { reply: string; actionPlan: ActionPlan | null; done: boolean; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
+      let iterationResult: { reply: string; actionPlan: ActionPlan | null; done: boolean; doneReason?: string; reasoningContent?: string; finishReason?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
       try {
         iterationResult = await runAgentIteration(
           provider,
@@ -700,7 +746,8 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
 \n`),
           abortController.signal,
           iteration,
-          httpTraceId
+          httpTraceId,
+          currentMaxTokensOverride,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
@@ -710,7 +757,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
           throw error;
         }
 
-        // Fallback to non-stream
+        // Fallback to non-stream (stream timed out before first token).
         const fallbackResult = await callOpenAICompatible(
           provider,
           currentMessages,
@@ -722,75 +769,77 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
         );
 
         if (fallbackResult.toolCalls && fallbackResult.toolCalls.length > 0) {
-          const actionPlan = parseActionPlanFromToolCalls(fallbackResult.toolCalls);
-          if (isPerceptionOnlyPlan(actionPlan)) {
-            res.write(`data: ${JSON.stringify({ type: "tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}
+          const fbTcs = fallbackResult.toolCalls;
+          const fbClass = classifyToolCalls(fbTcs);
+          res.write(`data: ${JSON.stringify({ type: "tool_call", tools: fbTcs.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })), classification: fbClass })}
 \n`);
-            iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };          } else if (isIterablePlan(actionPlan)) {
-            res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: fallbackResult.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}
-\n`);
-            iterationResult = { reply: fallbackResult.reply, actionPlan, done: false, toolCalls: fallbackResult.toolCalls };          } else {
-            res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}
-\n`);
-            iterationResult = { reply: fallbackResult.reply, actionPlan, done: true, toolCalls: fallbackResult.toolCalls };
-          }
+          iterationResult = { reply: fallbackResult.reply, actionPlan: parseActionPlanFromToolCalls(fallbackResult.toolCalls), done: false, toolCalls: fallbackResult.toolCalls, reasoningContent: fallbackResult.reasoningContent };
         } else {
           res.write(`data: ${JSON.stringify({ type: "fallback", reason: "no_stream_delta" })}
 \n`);
-          iterationResult = { reply: fallbackResult.reply, actionPlan: fallbackResult.actionPlan, done: true };
+          iterationResult = { reply: fallbackResult.reply, actionPlan: fallbackResult.actionPlan, done: true, reasoningContent: fallbackResult.reasoningContent };
         }
       }
 
       finalReply = iterationResult.reply;
       finalActionPlan = iterationResult.actionPlan;
 
-      // Save assistant reply to session history — always include tool_calls so
-      // that when the client later sends tool results via agent-continue, the
-      // preceding assistant message is present.  Orphaned tool_calls (where the
-      // user abandons the session) are cleaned up by sanitizeMessages() before
-      // each LLM call.
-      //
-      // reasoning_content is always included for tool-call rounds (DeepSeek
-      // requires it, otherwise 400).  For non-tool-call rounds we respect the
-      // includeReasoningContent config.
-      const wantReasoning = provider.includeReasoningContent ?? true;
+      // Doom loop detection: same (tool_name + params) called N times in a row?
       if (iterationResult.toolCalls && iterationResult.toolCalls.length > 0) {
-        currentMessages.push({
-          role: "assistant",
-          content: iterationResult.reply,
-          reasoning_content: iterationResult.reasoningContent,
-          tool_calls: iterationResult.toolCalls,
-        });
-      } else if (iterationResult.actionPlan && iterationResult.actionPlan.actions.length > 0) {
-        // Action plan from text parsing — create synthetic tool_calls for session
-        const syntheticToolCalls = iterationResult.actionPlan.actions.map((action, index) => ({
-          id: action.toolCallId || `text-parsed-${Date.now()}-${index}`,
-          type: "function" as const,
-          function: {
-            name: action.action,
-            arguments: JSON.stringify(action.params),
-          },
-        }));
-        currentMessages.push({
-          role: "assistant",
-          content: iterationResult.reply,
-          reasoning_content: iterationResult.reasoningContent,
-          tool_calls: syntheticToolCalls,
-        });
-      } else if (iterationResult.reply) {
-        currentMessages.push({
-          role: "assistant",
-          content: iterationResult.reply,
-          reasoning_content: wantReasoning ? iterationResult.reasoningContent : undefined,
-        });
+        for (const tc of iterationResult.toolCalls) {
+          if (tc.function.name !== "task_complete") {
+            recentToolFingerprints.push(fingerprintToolCall(tc));
+          }
+        }
+        if (detectDoomLoop(recentToolFingerprints)) {
+          res.write(`data: ${JSON.stringify({ type: "doom_loop", fingerprints: recentToolFingerprints.slice(-4) })}
+\n`);
+          await logIterationEnd(httpTraceId, { sessionId, iteration, done: true, reason: "doom_loop" });
+          finalReply = "检测到 Agent 陷入死循环（连续多次调用相同工具且参数相同），已自动终止。请检查任务描述或重新发起。";
+          finalActionPlan = null;
+          break;
+        }
+      }
+
+      // Append assistant message via the unified helper.
+      // buildAssistantMessage handles all three branches (tool_calls,
+      // text-parsed actionPlan, plain reply) in one place.
+      // reasoning_content is always included for tool-call rounds (DeepSeek
+      // requires it, otherwise 400).  For non-tool-call rounds we respect
+      // the includeReasoningContent config.
+      const wantReasoning = provider.includeReasoningContent ?? true;
+      const assistantMsg = buildAssistantMessage({
+        reply: iterationResult.reply,
+        actionPlan: iterationResult.actionPlan,
+        reasoningContent: iterationResult.reasoningContent,
+        finishReason: iterationResult.finishReason,
+        toolCalls: iterationResult.toolCalls,
+        done: iterationResult.done,
+        doneReason: (iterationResult.doneReason ?? (iterationResult.done ? "final_reply" : "tool_calls_pending")) as TurnResult["doneReason"],
+      });
+      if (assistantMsg) {
+        if (!assistantMsg.tool_calls && !wantReasoning) {
+          assistantMsg.reasoning_content = undefined;
+        }
+        currentMessages.push(assistantMsg);
       }
 
       if (iterationResult.done) {
         break;
       }
 
-      // Wait for tool results from client
-      // We must finish this response and expect client to call /v1/chat/agent-continue
+      // length_truncated → don't terminate; just bump maxTokens and loop again.
+      if (iterationResult.doneReason === "length_truncated") {
+        currentMaxTokensOverride = provider.maxTokens
+          ? Math.min(provider.maxTokens * 2, 16384)
+          : 8192;
+        // Don't push the await_tool_result event — we're staying on the
+        // server side and looping again.
+        continue;
+      }
+
+      // Otherwise: tool_calls_pending → wait for client to execute and
+      // call /v1/chat/agent-continue.
       res.write(`data: ${JSON.stringify({ type: "await_tool_result", iteration })}
 \n`);
       break;
@@ -800,6 +849,7 @@ app.post("/v1/chat/agent-stream", async (req, res) => {
     const session = getSession(sessionId);
     if (session) {
       session.messages = currentMessages;
+      session._doomFingerprints = recentToolFingerprints;
     }
 
     res.write(`data: ${JSON.stringify({
@@ -940,19 +990,46 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
       insertMode: insertMode as any,
     });
 
-    // Ensure the session has an assistant message with tool_calls before tool results.
-    // If the last message is not assistant or has no tool_calls, bail out.
+    // Ensure the session has at least one assistant message with matching
+    // tool_calls before we append tool results.  We don't just check the
+    // LAST assistant because DeepSeek sometimes returns a reasoning-only
+    // response (no tool_calls) that ends up as a trailing assistant message
+    // — the next agent-continue would then incorrectly fail.
     const lastAssistantIdx = [...session.messages].reverse().findIndex((m) => m.role === "assistant");
     if (lastAssistantIdx === -1) {
       return res.status(400).json({ error: "无法继续 Agent 循环：会话中没有 assistant 消息，无法附加工具结果。" });
     }
     const lastAssistant = session.messages[session.messages.length - 1 - lastAssistantIdx];
-    if (!lastAssistant.tool_calls || lastAssistant.tool_calls.length === 0) {
-      return res.status(400).json({ error: "无法继续 Agent 循环：上一轮 assistant 消息没有 tool_calls（通常是 tool_call_id 失配或 LLM 忽略工具结果导致的）。建议重新发起任务。" });
+
+    // Collect all tool_call IDs across *all* assistant messages in the session
+    const allToolCallIds = new Set<string>();
+    for (const m of session.messages) {
+      if (m.role === "assistant" && m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          allToolCallIds.add(tc.id);
+        }
+      }
     }
 
-    // Append tool results to session messages
-    for (const tr of parsed.data.toolResults) {
+    // Check if the incoming tool results reference known tool_call IDs
+    const unknownIds = parsed.data.toolResults.filter((tr) => !allToolCallIds.has(tr.toolCallId));
+    if (unknownIds.length === parsed.data.toolResults.length) {
+      return res.status(400).json({
+        error: `无法继续 Agent 循环：工具结果引用的 tool_call_id（${unknownIds.map((t) => t.toolCallId).join(", ")}）不在会话的任何 assistant 消息中。请重新发起任务。`,
+      });
+    }
+
+    // If the last assistant has no tool_calls but some tool results match
+    // earlier assistant messages, accept them.  The stale/duplicate results
+    // are harmless — the LLM will see repeated tool output and can ignore it.
+    // Filter out results for tool_call_ids that are NOT in the last assistant
+    // (stale results from previous iterations).
+    const validResults = parsed.data.toolResults.filter((tr) =>
+      lastAssistant.tool_calls?.some((tc: any) => tc.id === tr.toolCallId)
+    );
+
+    // Append valid tool results to session messages
+    for (const tr of validResults) {
       session.messages.push({
         role: "tool",
         content: tr.result,
@@ -960,6 +1037,9 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
         name: tr.toolName,
       });
     }
+
+    // If ALL results were stale, we still proceed — the LLM can respond
+    // based on the existing conversation without new tool data.
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -974,39 +1054,88 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     const continueIteration = (session._continueIteration ? session._continueIteration + 1 : 1);
     session._continueIteration = continueIteration;
 
-    let result: { reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
+    let result: { reply: string; actionPlan: ActionPlan | null; reasoningContent?: string; finishReason?: string; doneReason?: string; toolCalls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>; error?: string; nextMaxTokens?: number };
     try {
-      result = await streamOpenAICompatible(
+      const turn = await executeTurn({
         provider,
-        session.messages,
+        messages: session.messages,
         retrieved,
-        (delta) => res.write(`data: ${JSON.stringify({ type: "delta", delta })}
-\n`),
-        abortController.signal,
-        WORD_TOOLS,
+        tools: WORD_TOOLS,
         insertMode,
         documentStructureDescription,
-        dynamicContext
-      );
+        dynamicContext,
+        signal: abortController.signal,
+        onDelta: (delta) => res.write(`data: ${JSON.stringify({ type: "delta", delta })}\n\n`),
+        turnNumber: continueIteration,
+      });
+      result = {
+        reply: turn.reply,
+        actionPlan: turn.actionPlan,
+        reasoningContent: turn.reasoningContent,
+        finishReason: turn.finishReason,
+        toolCalls: turn.toolCalls,
+        doneReason: turn.doneReason,
+        error: turn.error,
+        nextMaxTokens: turn.nextMaxTokens,
+      };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      const shouldFallbackToNonStream = message.includes("first token not received");
+      // Hard error that executeTurn didn't handle (e.g. AbortError).
+      throw error;
+    }
 
-      if (!shouldFallbackToNonStream) {
-        throw error;
-      }
-
-      result = await callOpenAICompatible(
-        provider,
-        session.messages,
+    // Length truncated → retry internally with expanded maxTokens.
+    // The frontend never sees length_truncated as a terminal event.
+    if (result.doneReason === "length_truncated") {
+      const bumped = result.nextMaxTokens ?? Math.min((provider.maxTokens ?? 4096) * 2, 16384);
+      // Push the reasoning output already received so the frontend updates.
+      res.write(`data: ${JSON.stringify({ type: "length_truncated_retry", nextMaxTokens: bumped })}\n\n`);
+      const retryTurn = await executeTurn({
+        provider: { ...provider, maxTokens: bumped },
+        messages: session.messages,
         retrieved,
-        WORD_TOOLS,
+        tools: WORD_TOOLS,
         insertMode,
         documentStructureDescription,
-        dynamicContext
-      );
-      res.write(`data: ${JSON.stringify({ type: "fallback", reason: "no_stream_delta" })}
-\n`);
+        dynamicContext,
+        signal: abortController.signal,
+        onDelta: (delta) => res.write(`data: ${JSON.stringify({ type: "delta", delta })}\n\n`),
+        turnNumber: continueIteration,
+        maxTokensOverride: bumped,
+      });
+      result = {
+        reply: retryTurn.reply,
+        actionPlan: retryTurn.actionPlan,
+        reasoningContent: retryTurn.reasoningContent,
+        finishReason: retryTurn.finishReason,
+        toolCalls: retryTurn.toolCalls,
+        doneReason: retryTurn.doneReason,
+        error: retryTurn.error,
+        nextMaxTokens: retryTurn.nextMaxTokens,
+      };
+    }
+
+    // Doom-loop guard: track recent tool fingerprints across agent-continue
+    // invocations on this session.
+    if (!session._doomFingerprints) session._doomFingerprints = [];
+    if (result.toolCalls && result.toolCalls.length > 0) {
+      for (const tc of result.toolCalls) {
+        if (tc.function.name !== "task_complete") {
+          session._doomFingerprints.push(fingerprintToolCall(tc));
+        }
+      }
+      if (detectDoomLoop(session._doomFingerprints)) {
+        res.write(`data: ${JSON.stringify({ type: "doom_loop", fingerprints: session._doomFingerprints.slice(-4) })}\n\n`);
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "doom_loop" });
+        res.write(`data: ${JSON.stringify({
+          type: "done",
+          reply: "检测到 Agent 陷入死循环（连续多次调用相同工具且参数相同），已自动终止。请检查任务描述或重新发起。",
+          actionPlan: null,
+          sessionId: session.id,
+          retrievalCount: retrieved.length,
+          citations: retrieved.map((c) => ({ id: c.id, fileName: c.fileName })),
+        })}\n\n`);
+        return res.end();
+      }
     }
 
     // Save the new assistant message to session for next iteration.
@@ -1018,63 +1147,57 @@ app.post("/v1/chat/agent-continue", async (req, res) => {
     // requires it, otherwise 400).  For non-tool-call rounds we respect the
     // includeReasoningContent config.
     const wantReasoning = provider.includeReasoningContent ?? true;
-    if (result.toolCalls && result.toolCalls.length > 0) {
-      session.messages.push({
-        role: "assistant",
-        content: result.reply,
-        reasoning_content: result.reasoningContent,
-        tool_calls: result.toolCalls,
-      });
-    } else if (result.actionPlan && result.actionPlan.actions.length > 0) {
-      // Action plan from text parsing — create synthetic tool_calls for session
-      const syntheticToolCalls = result.actionPlan.actions.map((action, index) => ({
-        id: action.toolCallId || `text-parsed-${Date.now()}-${index}`,
-        type: "function" as const,
-        function: {
-          name: action.action,
-          arguments: JSON.stringify(action.params),
-        },
-      }));
-      session.messages.push({
-        role: "assistant",
-        content: result.reply,
-        reasoning_content: result.reasoningContent,
-        tool_calls: syntheticToolCalls,
-      });
-    } else if (result.reply) {
-      session.messages.push({
-        role: "assistant",
-        content: result.reply,
-        reasoning_content: wantReasoning ? result.reasoningContent : undefined,
-      });
+    const turnResult: TurnResult = {
+      reply: result.reply,
+      actionPlan: result.actionPlan,
+      reasoningContent: result.reasoningContent,
+      finishReason: result.finishReason,
+      toolCalls: result.toolCalls,
+      done: result.doneReason !== "tool_calls_pending",
+      doneReason: (result.doneReason ?? "final_reply") as TurnResult["doneReason"],
+    };
+    const assistantMsg = buildAssistantMessage(turnResult);
+    if (assistantMsg) {
+      if (!assistantMsg.tool_calls && !wantReasoning) {
+        assistantMsg.reasoning_content = undefined;
+      }
+      session.messages.push(assistantMsg);
     }
 
-    // If tool calls again, check for task_complete or send tool_call/action_plan event
-    if (result.toolCalls && result.toolCalls.length > 0) {
-      // Check if task_complete is called — stop the loop
-      const taskCompleteCall = result.toolCalls.find((tc) => tc.function.name === "task_complete");
-      if (taskCompleteCall) {
-        let summary = "任务已完成";
-        const taskArgs = safeParseToolArgs(taskCompleteCall.function.arguments);
-        summary = taskArgs.summary || summary;
+    // Branch on the unified doneReason
+    switch (result.doneReason) {
+      case "tool_calls_pending": {
+        const tcs = result.toolCalls || [];
+        const classification = classifyToolCalls(tcs);
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: false, reason: "tool_calls_pending" });
+        res.write(`data: ${JSON.stringify({
+          type: "tool_call",
+          tools: tcs.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })),
+          classification,
+        })}\n\n`);
+        break;
+      }
+      case "task_complete": {
+        const summary = turnResult.taskCompleteSummary || "任务已完成";
         await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: `task_complete: ${summary}` });
         res.write(`data: ${JSON.stringify({ type: "task_complete", summary })}\n\n`);
-      } else {
-        const actionPlan = parseActionPlanFromToolCalls(result.toolCalls);
-        if (isPerceptionOnlyPlan(actionPlan)) {
-          await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: false, reason: "perception_only_plan" });
-          res.write(`data: ${JSON.stringify({ type: "tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}\n\n`);
-        } else if (isIterablePlan(actionPlan)) {
-          await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: false, reason: "iterable_plan" });
-          res.write(`data: ${JSON.stringify({ type: "iterable_tool_call", tools: result.toolCalls.map((tc) => ({ id: tc.id, tool: tc.function.name, params: safeParseToolArgs(tc.function.arguments) })) })}\n\n`);
-        } else {
-          await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "action_plan" });
-          res.write(`data: ${JSON.stringify({ type: "action_plan", plan: actionPlan })}\n\n`);
-        }
+        break;
       }
-    } else {
-      // No tool calls — final reply from agent-continue
-      await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "final_reply" });
+      case "length_truncated":
+        // Already handled above with an internal retry. If control reaches
+        // here, the retry was also truncated — treat as final reply.
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "length_truncated_after_retry" });
+        break;
+      case "no_content":
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "no_content" });
+        break;
+      case "error":
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: `error: ${result.error ?? "unknown"}` });
+        throw new Error(result.error || "LLM error");
+      case "final_reply":
+      default:
+        await logIterationEnd(httpTraceId, { sessionId: session.id, iteration: continueIteration, done: true, reason: "final_reply" });
+        break;
     }
 
     res.write(`data: ${JSON.stringify({

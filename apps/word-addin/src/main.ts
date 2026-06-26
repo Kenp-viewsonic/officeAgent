@@ -83,6 +83,7 @@ const state: {
   pendingSessionId: string | null;
   pendingAttachment: { fileName: string; content: string } | null;
   isAgentRunning: boolean;
+  autopilot: boolean;
 } = {
   sessions: [],
   activeSessionId: null,
@@ -92,6 +93,7 @@ const state: {
   pendingSessionId: null,
   pendingAttachment: null,
   isAgentRunning: false,
+  autopilot: false,
 };
 
 // Module-level AbortController shared by all in-flight fetch calls in the
@@ -3392,6 +3394,21 @@ async function sendAgentMessageStream(
 
       if (event.type === "tool_call") {
         hasToolCall = true;
+
+        // Autopilot: execute ALL tools inline, regardless of type.
+        if (state.autopilot) {
+          const executedTools: Array<{ tool: string; params: Record<string, any> }> = [];
+          for (const tool of event.tools) {
+            appendToolCallCard(tool.tool, tool.params);
+            const result = await executeSingleTool(tool);
+            appendToolResultCard(tool.tool, result.success, result.result);
+            toolResults.push(result);
+            executedTools.push({ tool: tool.tool, params: tool.params });
+          }
+          await autoReadAfterMutation(executedTools, toolResults);
+          continue;
+        }
+
         for (const tool of event.tools) {
           const perceptionTools = ["read_document", "get_selection_info", "get_document_stats", "get_paragraph_format", "get_document_tables", "read_table"];
           if (!perceptionTools.includes(tool.tool)) {
@@ -3989,6 +4006,41 @@ function bindActions(): void {
   // Insert actions
   $("retryLast").addEventListener("click", () => {
     void retryLastMessage();
+  });
+
+  // Autopilot toggle — shows a confirmation modal before engaging auto-execute mode
+  const autopilotCheckbox = $<HTMLInputElement>("autopilotToggle");
+  const autopilotModal = $<HTMLDivElement>("autopilotModal");
+  const autopilotModalConfirm = $<HTMLButtonElement>("autopilotConfirm");
+  const autopilotModalCancel = $<HTMLButtonElement>("autopilotCancel");
+
+  autopilotCheckbox.addEventListener("change", () => {
+    if (autopilotCheckbox.checked) {
+      // Show the custom modal instead of native confirm()
+      autopilotModal.style.display = "";
+
+      const onConfirm = () => {
+        autopilotModal.style.display = "none";
+        autopilotModalConfirm.removeEventListener("click", onConfirm);
+        autopilotModalCancel.removeEventListener("click", onCancel);
+        state.autopilot = true;
+        setStatus(chatStatus, "🚀 Autopilot 已开启 — 所有操作将自动执行");
+      };
+
+      const onCancel = () => {
+        autopilotModal.style.display = "none";
+        autopilotModalConfirm.removeEventListener("click", onConfirm);
+        autopilotModalCancel.removeEventListener("click", onCancel);
+        autopilotCheckbox.checked = false;
+        setStatus(chatStatus, "");
+      };
+
+      autopilotModalConfirm.addEventListener("click", onConfirm);
+      autopilotModalCancel.addEventListener("click", onCancel);
+    } else {
+      state.autopilot = false;
+      setStatus(chatStatus, "Autopilot 已关闭");
+    }
   });
 
   // Simple preview (legacy)

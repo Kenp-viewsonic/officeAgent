@@ -83,7 +83,7 @@ export async function logRequestStart(log: RequestStartLog): Promise<string> {
 
 export async function logResponseRaw(
   traceId: string,
-  info: { status: number; contentType?: string; bodyPreview?: string; streamChunkCount?: number }
+  info: { status: number; contentType?: string; bodyPreview?: string; streamChunkCount?: number; fullTextLength?: number; fullReasoningLength?: number }
 ): Promise<void> {
   await appendLog({
     event: "response_raw",
@@ -92,6 +92,8 @@ export async function logResponseRaw(
     contentType: info.contentType,
     bodyPreview: info.bodyPreview,
     streamChunkCount: info.streamChunkCount,
+    fullTextLength: info.fullTextLength,
+    fullReasoningLength: info.fullReasoningLength,
   });
 }
 

@@ -133,6 +133,9 @@ export type AgentSession = {
   dynamicContext?: { documentContext?: string; selection?: string };
   /** Internal counter for agent-continue iteration tracking */
   _continueIteration?: number;
+  /** Rolling list of recent (tool_name + normalized params) fingerprints
+   *  used by the doom-loop detector. Cleared when the session is reset. */
+  _doomFingerprints?: string[];
 };
 
 // --- Tool Definitions (OpenAI Function Calling format) ---

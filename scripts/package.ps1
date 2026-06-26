@@ -57,6 +57,11 @@ Copy-Item (Join-Path $root "scripts\install.bat") (Join-Path $distDir "install.b
 Copy-Item (Join-Path $root "scripts\start.bat") (Join-Path $distDir "start.bat")
 Copy-Item (Join-Path $root "scripts\stop.bat") (Join-Path $distDir "stop.bat")
 Copy-Item (Join-Path $root "scripts\uninstall.bat") (Join-Path $distDir "uninstall.bat")
+Copy-Item (Join-Path $root "scripts\logo.ps1") (Join-Path $distDir "logo.ps1")
+# logo.ps1 contains box-drawing chars; PS 5.1 needs UTF-8 BOM to read them
+$logoDst = Join-Path $distDir "logo.ps1"
+$logoText = [System.IO.File]::ReadAllText($logoDst, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($logoDst, $logoText, (New-Object System.Text.UTF8Encoding($true)))
 
 # Copy README
 Copy-Item (Join-Path $root "scripts\README-dist.md") (Join-Path $distDir "README.md")
